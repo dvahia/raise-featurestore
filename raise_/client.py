@@ -21,6 +21,12 @@ from raise_.models.audit import AuditClient, AuditQuery
 from raise_.analytics.client import AnalyticsClient
 from raise_.analytics.analysis import Analysis
 from raise_.analytics.dashboard import Dashboard
+from raise_.transforms.client import TransformsClient
+from raise_.transforms.job import Job
+from raise_.transforms.source import Source
+from raise_.transforms.transform import Transform
+from raise_.transforms.schedule import Schedule
+from raise_.transforms.checkpoint import IncrementalConfig
 from raise_.exceptions import (
     OrganizationNotFoundError,
     DomainNotFoundError,
@@ -76,6 +82,9 @@ class FeatureStore:
     # Analytics client
     analytics: AnalyticsClient = field(init=False, repr=False)
 
+    # Transforms client
+    transforms: TransformsClient = field(init=False, repr=False)
+
     def __init__(
         self,
         path: str | None = None,
@@ -113,6 +122,9 @@ class FeatureStore:
 
         # Initialize analytics client
         self.analytics = AnalyticsClient(self)
+
+        # Initialize transforms client
+        self.transforms = TransformsClient(self)
 
         # Auto-create context if specified
         if org:
@@ -663,6 +675,60 @@ class FeatureStore:
     def list_alerts(self) -> list[Any]:
         """List all analytics alerts."""
         return self.analytics.list_alerts()
+
+    # =========================================================================
+    # Transform methods
+    # =========================================================================
+
+    def create_job(
+        self,
+        name: str,
+        sources: list[Source] | Source | None = None,
+        transform: Transform | None = None,
+        target: str | None = None,
+        schedule: Schedule | None = None,
+        incremental: IncrementalConfig | None = None,
+        **kwargs,
+    ) -> Job:
+        """
+        Create a transformation job.
+
+        Args:
+            name: Job name.
+            sources: Input data source(s).
+            transform: Transformation logic.
+            target: Target feature group path.
+            schedule: Execution schedule.
+            incremental: Incremental processing config.
+
+        Returns:
+            The created Job.
+        """
+        return self.transforms.create_job(
+            name=name,
+            sources=sources,
+            transform=transform,
+            target=target,
+            schedule=schedule,
+            incremental=incremental,
+            **kwargs,
+        )
+
+    def get_job(self, name: str) -> Job:
+        """Get a job by name."""
+        return self.transforms.get_job(name)
+
+    def list_jobs(self, **kwargs) -> list[Job]:
+        """List transformation jobs."""
+        return self.transforms.list_jobs(**kwargs)
+
+    def deploy_job(self, job: Job | str) -> Any:
+        """Deploy a job to the orchestrator."""
+        return self.transforms.deploy(job)
+
+    def trigger_job(self, job: Job | str) -> str:
+        """Manually trigger a job run."""
+        return self.transforms.trigger(job)
 
     def __repr__(self) -> str:
         context_parts = []

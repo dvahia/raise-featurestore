@@ -1,8 +1,10 @@
 # Raise Feature Store - Product Requirements Document
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Ready for Engineering Review
 **Last Updated:** 2026-02-21
+
+> **v1.1 Changes:** Added ETL/Transformations (Section 15) and Airflow Integration (Section 16)
 
 ---
 
@@ -30,11 +32,13 @@ This PRD defines the backend systems and middleware required to support the Rais
 12. [Live Tables (CDC)](#12-live-tables-cdc)
 13. [Dashboards](#13-dashboards)
 14. [Alerting System](#14-alerting-system)
-15. [Storage Requirements](#15-storage-requirements)
-16. [API Layer](#16-api-layer)
-17. [Non-Functional Requirements](#17-non-functional-requirements)
-18. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
-19. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
+15. [ETL and Transformations](#15-etl-and-transformations)
+16. [Airflow Integration](#16-airflow-integration)
+17. [Storage Requirements](#17-storage-requirements)
+18. [API Layer](#18-api-layer)
+19. [Non-Functional Requirements](#19-non-functional-requirements)
+20. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
+21. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
 
 ---
 
@@ -50,14 +54,16 @@ This PRD defines the backend systems and middleware required to support the Rais
 6. **Immutable Versioning**: Ensure schema changes create new versions (audit trail)
 7. **Comprehensive Analytics**: Provide aggregations, distributions, statistical tests, and dashboards
 8. **Real-Time Updates**: Support CDC-based live tables for analytics materialization
+9. **ETL/Transformations**: Support data transformation pipelines with SQL and Python, integrated with Airflow
+10. **Incremental Processing**: Checkpoint-based incremental updates with support for late-arriving data
 
 ### Non-Goals (v1)
 
 1. Feature serving at inference time (online store)
 2. Real-time streaming ingestion
-3. Data transformation pipelines (ETL orchestration)
-4. Model training integration
-5. Feature monitoring/observability dashboards (built-in UI)
+3. Model training integration
+4. Feature monitoring/observability dashboards (built-in UI)
+5. Backfill orchestration (manual backfills supported, automated orchestration deferred)
 
 ---
 
@@ -1326,9 +1332,396 @@ for alert in get_active_alerts():
 
 ---
 
-## 15. Storage Requirements
+## 15. ETL and Transformations
 
-### 15.1 Metadata Store
+### 15.1 Overview
+
+The ETL module enables data transformation pipelines that populate features from various data sources. Transformations are defined as Jobs that combine Sources, Transforms, Targets, and Schedules.
+
+**Key Design Principles:**
+- Pipelines are low-level infrastructure constructs, hidden from end users
+- Users work with high-level Job abstractions
+- Jobs have lineage relationships with features
+- Support both SQL and Python transformations
+- Incremental processing with checkpoint management
+
+### 15.2 Job Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                            Job                                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │   Sources   │  │  Transform  │  │   Target    │             │
+│  │  (1 or more)│  │  (SQL/Py)   │  │  (Features) │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+│         │                │                │                      │
+│         └────────────────┼────────────────┘                      │
+│                          │                                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │  Schedule   │  │ Incremental │  │   Quality   │             │
+│  │             │  │   Config    │  │   Checks    │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+└─────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+            ┌─────────────────────────┐
+            │     Orchestrator        │
+            │  (Airflow, Internal)    │
+            └─────────────────────────┘
+```
+
+### 15.3 Source Types
+
+| Source Type | Description | Use Case |
+|-------------|-------------|----------|
+| `ObjectStorage` | S3, GCS, Azure Blob | Raw event data, logs |
+| `FileSystem` | Local/network files | Development, batch exports |
+| `ColumnarSource` | Data warehouse tables | Aggregated data |
+| `FeatureGroupSource` | Existing features | Feature derivation |
+| `DatabaseSource` | JDBC/ODBC connections | Operational databases |
+
+#### Source Schema
+
+```sql
+CREATE TABLE job_sources (
+    id UUID PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs(id),
+    source_type VARCHAR(32) NOT NULL,
+    name VARCHAR(128),
+    config JSONB NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+### 15.4 Transform Types
+
+#### SQL Transform
+
+```json
+{
+    "transform_type": "sql",
+    "name": "daily_clicks_transform",
+    "sql": "SELECT user_id, COUNT(*) as clicks FROM source WHERE event_time >= '{{checkpoint}}' GROUP BY user_id",
+    "source_aliases": {"source": "clickstream"},
+    "parameters": {}
+}
+```
+
+**Template Variables:**
+- `{{checkpoint}}` - Current checkpoint value
+- `{{execution_date}}` - Logical execution date
+- `{{run_id}}` - Unique run identifier
+- `{{param_name}}` - Custom parameters
+
+#### Python Transform
+
+```json
+{
+    "transform_type": "python",
+    "name": "segment_users",
+    "function_name": "segment_users",
+    "module_path": "transforms.segmentation",
+    "dependencies": ["pandas", "numpy"]
+}
+```
+
+**Python Function Signature:**
+```python
+def transform_function(context: TransformContext, data: Any) -> Any:
+    # context provides: job_id, run_id, execution_date, checkpoint_value
+    # data is the output from source/SQL stage
+    return transformed_data
+```
+
+#### Hybrid Transform
+
+Executes SQL first, then applies Python post-processing:
+
+```json
+{
+    "transform_type": "hybrid",
+    "sql_transform": { ... },
+    "python_transform": { ... }
+}
+```
+
+### 15.5 Incremental Processing
+
+#### Processing Modes
+
+| Mode | Description | Checkpoint |
+|------|-------------|------------|
+| `FULL` | Complete recompute every run | None |
+| `INCREMENTAL` | Process only new/changed data | Timestamp/offset |
+| `APPEND` | Only append new records | Monotonic ID |
+| `UPSERT` | Insert or update by key | Timestamp |
+
+#### Checkpoint Schema
+
+```sql
+CREATE TABLE job_checkpoints (
+    id UUID PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs(id) UNIQUE,
+    checkpoint_type VARCHAR(32) NOT NULL,
+    checkpoint_value JSONB,
+    checkpoint_column VARCHAR(128),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+#### Checkpoint Flow
+
+```
+1. Load checkpoint from store
+2. Query source with checkpoint filter: WHERE col >= checkpoint
+3. Apply optional lookback: WHERE col >= checkpoint - lookback
+4. Execute transform
+5. Write to target
+6. Update checkpoint to max(col) from processed data
+7. Commit checkpoint
+```
+
+### 15.6 Target Configuration
+
+```json
+{
+    "feature_group": "user-signals",
+    "features": {
+        "daily_clicks": "clicks",
+        "daily_revenue": "revenue"
+    },
+    "write_mode": "upsert",
+    "key_columns": ["user_id", "date"]
+}
+```
+
+**Write Modes:**
+- `append` - Insert new rows
+- `overwrite` - Replace all data
+- `upsert` - Update existing, insert new (requires key_columns)
+
+### 15.7 Schedule Types
+
+| Schedule | Expression | Description |
+|----------|------------|-------------|
+| `CronSchedule` | `"0 2 * * *"` | Standard cron |
+| `IntervalSchedule` | `"30m"`, `"6h"` | Fixed interval |
+| `OnChangeSchedule` | CDC-triggered | When source changes |
+| `ManualSchedule` | None | Manual trigger only |
+| `OnceSchedule` | Timestamp | Single execution |
+
+### 15.8 Quality Checks
+
+Quality checks run after transformation:
+
+| Check Type | Parameters | Severity |
+|------------|------------|----------|
+| `NullCheck` | column, max_null_rate | ERROR |
+| `UniqueCheck` | columns | ERROR |
+| `RangeCheck` | column, min, max | ERROR |
+| `RowCountCheck` | min_rows, max_rows | WARNING |
+| `FreshnessCheck` | column, max_age | ERROR |
+| `CustomCheck` | function | Configurable |
+
+#### Quality Report Schema
+
+```sql
+CREATE TABLE job_quality_reports (
+    id UUID PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES job_runs(id),
+    passed BOOLEAN NOT NULL,
+    checks JSONB NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+### 15.9 Job Lifecycle
+
+```
+DRAFT → ACTIVE → PAUSED → ACTIVE → DEPRECATED
+           ↓         ↑
+         FAILED ─────┘
+```
+
+| Status | Description |
+|--------|-------------|
+| `DRAFT` | Job created, not deployed |
+| `ACTIVE` | Job deployed and scheduled |
+| `PAUSED` | Job deployed but not running |
+| `FAILED` | Job failed, requires intervention |
+| `DEPRECATED` | Job retired |
+
+### 15.10 Job Metadata Schema
+
+```sql
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY,
+    org_id UUID NOT NULL REFERENCES organizations(id),
+    name VARCHAR(128) NOT NULL,
+    description TEXT,
+    owner VARCHAR(256),
+    tags VARCHAR(64)[] DEFAULT '{}',
+    sources JSONB NOT NULL DEFAULT '[]',
+    transform JSONB NOT NULL,
+    target JSONB NOT NULL,
+    schedule JSONB NOT NULL,
+    incremental JSONB NOT NULL DEFAULT '{}',
+    retries INT DEFAULT 3,
+    retry_delay INTERVAL DEFAULT '5 minutes',
+    timeout INTERVAL DEFAULT '1 hour',
+    alerts VARCHAR(256)[] DEFAULT '{}',
+    status VARCHAR(32) DEFAULT 'draft',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE(org_id, name)
+);
+
+CREATE INDEX idx_jobs_status ON jobs(status);
+CREATE INDEX idx_jobs_tags ON jobs USING GIN(tags);
+```
+
+### 15.11 Job Run Schema
+
+```sql
+CREATE TABLE job_runs (
+    id UUID PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs(id),
+    status VARCHAR(32) NOT NULL,
+    execution_date TIMESTAMP NOT NULL,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    rows_read BIGINT DEFAULT 0,
+    rows_written BIGINT DEFAULT 0,
+    checkpoint_before JSONB,
+    checkpoint_after JSONB,
+    metrics JSONB DEFAULT '{}',
+    error TEXT
+);
+
+CREATE INDEX idx_runs_job ON job_runs(job_id);
+CREATE INDEX idx_runs_status ON job_runs(status);
+CREATE INDEX idx_runs_execution_date ON job_runs(execution_date);
+```
+
+### 15.12 Observability
+
+#### Standard Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `transform_rows_read` | Counter | Rows read from sources |
+| `transform_rows_written` | Counter | Rows written to target |
+| `transform_duration_seconds` | Histogram | Total execution time |
+| `transform_source_read_seconds` | Histogram | Source read time |
+| `transform_transform_seconds` | Histogram | Transform execution time |
+| `transform_sink_write_seconds` | Histogram | Target write time |
+| `transform_checkpoint_lag_seconds` | Gauge | Time behind real-time |
+| `transform_quality_checks_passed` | Counter | Passed quality checks |
+| `transform_quality_checks_failed` | Counter | Failed quality checks |
+
+---
+
+## 16. Airflow Integration
+
+### 16.1 DAG Generation
+
+Jobs are compiled to Airflow DAGs for execution:
+
+```
+Job Definition → DAG Generator → Python DAG File → Airflow Deployment
+```
+
+#### Generated DAG Structure
+
+```python
+with DAG(dag_id="raise_{job_name}", ...) as dag:
+    start = EmptyOperator(task_id='start')
+    transform = PythonOperator(task_id='transform', ...)
+    quality_checks = PythonOperator(task_id='quality_checks', ...)
+    end = EmptyOperator(task_id='end')
+
+    start >> transform >> quality_checks >> end
+```
+
+### 16.2 Airflow Configuration
+
+```python
+AirflowConfig(
+    dag_folder="/opt/airflow/dags",
+    default_args={
+        "owner": "raise",
+        "retries": 3,
+        "retry_delay": timedelta(minutes=5),
+    },
+    catchup=False,
+    max_active_runs=1,
+    tags=["raise", "feature-store"],
+    pool="raise_transforms",
+    queue="default",
+)
+```
+
+### 16.3 Schedule Mapping
+
+| Raise Schedule | Airflow Schedule |
+|----------------|------------------|
+| `CronSchedule("0 2 * * *")` | `schedule_interval="0 2 * * *"` |
+| `IntervalSchedule("1h")` | `schedule_interval=timedelta(hours=1)` |
+| `ManualSchedule()` | `schedule_interval=None` |
+| `OnChangeSchedule()` | External trigger + sensors |
+
+### 16.4 Deployment API
+
+```
+POST /v1/jobs/{job_id}/deploy
+  → Generates DAG file
+  → Writes to DAG folder
+  → Returns orchestrator_id, url
+
+POST /v1/jobs/{job_id}/trigger
+  → Calls Airflow API: POST /api/v1/dags/{dag_id}/dagRuns
+  → Returns run_id
+
+GET /v1/jobs/{job_id}/status
+  → Queries Airflow API: GET /api/v1/dags/{dag_id}
+  → Returns deployment status, last_run, next_run
+```
+
+### 16.5 Airflow REST API Integration
+
+| Operation | Airflow Endpoint |
+|-----------|------------------|
+| Trigger DAG | `POST /api/v1/dags/{dag_id}/dagRuns` |
+| Get DAG Status | `GET /api/v1/dags/{dag_id}` |
+| Get DAG Runs | `GET /api/v1/dags/{dag_id}/dagRuns` |
+| Pause DAG | `PATCH /api/v1/dags/{dag_id}` (is_paused=true) |
+| Delete DAG | `DELETE /api/v1/dags/{dag_id}` |
+
+### 16.6 Future: Pluggable Orchestrators
+
+The orchestrator interface is designed to be extensible:
+
+```python
+class Orchestrator(ABC):
+    def deploy(self, job: Job) -> DeploymentResult
+    def undeploy(self, job: Job) -> bool
+    def trigger(self, job: Job, execution_date: datetime) -> str
+    def get_status(self, job: Job) -> JobOrchestratorStatus
+    def generate_definition(self, job: Job) -> str
+```
+
+**Planned Orchestrators:**
+- `AirflowOrchestrator` ✓ (implemented)
+- `InternalOrchestrator` ✓ (implemented, for dev/test)
+- `DagsterOrchestrator` (future)
+- `PrefectOrchestrator` (future)
+
+---
+
+## 17. Storage Requirements
+
+### 17.1 Metadata Store
 
 **Technology:** PostgreSQL 14+
 
@@ -1408,7 +1801,7 @@ for alert in get_active_alerts():
 
 ---
 
-## 16. API Layer
+## 18. API Layer
 
 ### 16.1 REST API Endpoints
 
@@ -1535,13 +1928,31 @@ DELETE /v1/analytics/alerts/{name}
 POST   /v1/analytics/alerts/{name}/test
 ```
 
-### 16.2 Authentication
+#### Jobs
+```
+GET    /v1/jobs
+POST   /v1/jobs
+GET    /v1/jobs/{name}
+PATCH  /v1/jobs/{name}
+DELETE /v1/jobs/{name}
+POST   /v1/jobs/{name}/deploy
+POST   /v1/jobs/{name}/undeploy
+POST   /v1/jobs/{name}/trigger
+GET    /v1/jobs/{name}/status
+GET    /v1/jobs/{name}/runs
+GET    /v1/jobs/{name}/runs/{run_id}
+POST   /v1/jobs/{name}/checkpoint/reset
+GET    /v1/jobs/{name}/lineage
+GET    /v1/jobs/{name}/dag
+```
+
+### 18.2 Authentication
 
 - OAuth2 / OIDC for user authentication
 - API keys for service-to-service
 - JWT tokens with org/user claims
 
-### 16.3 Rate Limiting
+### 18.3 Rate Limiting
 
 | Tier | Requests/min | Concurrent Jobs |
 |------|--------------|-----------------|
@@ -1549,7 +1960,7 @@ POST   /v1/analytics/alerts/{name}/test
 | Standard | 1000 | 10 |
 | Enterprise | 10000 | 100 |
 
-### 16.4 Error Responses
+### 18.4 Error Responses
 
 ```json
 {
@@ -1566,9 +1977,9 @@ POST   /v1/analytics/alerts/{name}/test
 
 ---
 
-## 17. Non-Functional Requirements
+## 19. Non-Functional Requirements
 
-### 17.1 Performance
+### 19.1 Performance
 
 | Operation | Target Latency (p99) |
 |-----------|---------------------|
@@ -1581,14 +1992,14 @@ POST   /v1/analytics/alerts/{name}/test
 | Live table query | < 200ms |
 | Dashboard render | < 2s |
 
-### 17.2 Availability
+### 19.2 Availability
 
 - **Target SLA:** 99.9% (8.76 hours downtime/year)
 - **Metadata store:** Multi-AZ deployment
 - **Analytics:** Graceful degradation (serve cached results)
 - **CDC:** At-least-once delivery
 
-### 17.3 Scalability
+### 19.3 Scalability
 
 | Dimension | Initial | Scale Target |
 |-----------|---------|--------------|
@@ -1598,7 +2009,7 @@ POST   /v1/analytics/alerts/{name}/test
 | Analytics jobs/day | 1,000 | 1,000,000 |
 | Audit events/day | 100,000 | 100,000,000 |
 
-### 17.4 Security
+### 19.4 Security
 
 - **Encryption at rest:** AES-256 for all data stores
 - **Encryption in transit:** TLS 1.3 for all connections
@@ -1606,14 +2017,14 @@ POST   /v1/analytics/alerts/{name}/test
 - **Audit:** All access logged, immutable audit trail
 - **Network:** VPC isolation, private endpoints
 
-### 17.5 Compliance
+### 19.5 Compliance
 
 - **Data residency:** Support region-specific deployment
 - **Data retention:** Configurable per organization
 - **Right to deletion:** Support GDPR/CCPA data removal
 - **Audit export:** SOC2/ISO27001 compliant exports
 
-### 17.6 Disaster Recovery
+### 19.6 Disaster Recovery
 
 - **RPO:** 1 hour (point-in-time recovery)
 - **RTO:** 4 hours (full service restoration)

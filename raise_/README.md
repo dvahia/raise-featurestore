@@ -53,6 +53,14 @@ user_signals.create_feature(
   - [Live Tables](#live-tables)
   - [Dashboards](#dashboards)
   - [Analytics Alerts](#analytics-alerts)
+- [Transformations](#transformations)
+  - [Creating Jobs](#creating-jobs)
+  - [Sources](#sources)
+  - [Transforms (SQL/Python)](#transforms-sqlpython)
+  - [Schedules](#schedules)
+  - [Incremental Processing](#incremental-processing)
+  - [Quality Checks](#quality-checks)
+  - [Airflow Integration](#airflow-integration)
 - [API Reference](#api-reference)
 
 ---
@@ -1058,6 +1066,250 @@ print(result.data)
 
 ---
 
+## Transformations
+
+Raise supports ETL transformations that populate features from various data sources.
+
+### Creating Jobs
+
+```python
+from raise_ import (
+    FeatureStore,
+    ObjectStorage,
+    SQLTransform,
+    Schedule,
+    Target,
+    IncrementalConfig,
+)
+
+fs = FeatureStore("acme/mlplatform/recommendation")
+
+# Create a transformation job
+job = fs.create_job(
+    name="compute_daily_clicks",
+    sources=[
+        ObjectStorage(
+            path="s3://data-lake/events/clickstream/",
+            format="parquet",
+        )
+    ],
+    transform=SQLTransform(
+        name="daily_clicks_transform",
+        sql="""
+            SELECT user_id, DATE(event_time) as date, COUNT(*) as clicks
+            FROM source
+            WHERE event_time >= '{{checkpoint}}'
+            GROUP BY user_id, DATE(event_time)
+        """,
+    ),
+    target=Target(
+        feature_group="user-signals",
+        features={"clicks": "daily_clicks"},
+        write_mode="upsert",
+        key_columns=["user_id", "date"],
+    ),
+    schedule=Schedule.daily(hour=2),
+    incremental=IncrementalConfig.incremental("event_time"),
+)
+
+# Activate and deploy
+job.activate()
+result = fs.deploy_job(job)
+print(f"Deployed: {result.url}")
+```
+
+### Sources
+
+```python
+from raise_ import ObjectStorage, FileSystem, ColumnarSource, FeatureGroupSource
+
+# S3/GCS/Azure Blob
+s3 = ObjectStorage(
+    path="s3://bucket/prefix/",
+    format="parquet",
+    partition_columns=["year", "month", "day"],
+)
+
+# Local/network filesystem
+local = FileSystem(
+    path="/data/exports/",
+    format="csv",
+    glob_pattern="*.csv",
+)
+
+# Data warehouse table
+warehouse = ColumnarSource(
+    catalog="analytics",
+    database="production",
+    table="events",
+    filter="timestamp >= CURRENT_DATE - INTERVAL '7 days'",
+)
+
+# Read from existing features
+features = FeatureGroupSource(
+    feature_group="acme/mlplatform/recommendation/user-signals",
+    features=["daily_clicks", "daily_revenue"],
+)
+```
+
+### Transforms (SQL/Python)
+
+#### SQL Transform
+
+```python
+from raise_ import SQLTransform
+
+transform = SQLTransform(
+    name="aggregate_clicks",
+    sql="""
+        SELECT
+            user_id,
+            DATE(event_time) as date,
+            COUNT(*) as clicks,
+            SUM(revenue) as revenue
+        FROM source
+        WHERE event_time >= '{{checkpoint}}'
+        GROUP BY user_id, DATE(event_time)
+    """,
+)
+```
+
+**Template Variables:**
+- `{{checkpoint}}` - Current checkpoint value
+- `{{execution_date}}` - Logical execution date
+- `{{run_id}}` - Unique run identifier
+
+#### Python Transform
+
+```python
+from raise_.transforms import python_transform
+
+@python_transform(name="segment_users", dependencies=["pandas"])
+def segment_users(context, data):
+    import pandas as pd
+    df = pd.DataFrame(data)
+
+    def assign_segment(row):
+        if row["revenue"] > 100:
+            return "high_value"
+        elif row["clicks"] > 50:
+            return "engaged"
+        else:
+            return "casual"
+
+    df["segment"] = df.apply(assign_segment, axis=1)
+    return df.to_dict("records")
+
+# Use in a job
+job = fs.create_job(
+    name="segment_users",
+    sources=[FeatureGroupSource(feature_group="user-signals")],
+    transform=segment_users,
+    target="user-signals",
+)
+```
+
+### Schedules
+
+```python
+from raise_ import Schedule
+
+# Cron expression
+Schedule.cron("0 */6 * * *")  # Every 6 hours
+
+# Daily at specific time
+Schedule.daily(hour=2, minute=30)
+
+# Hourly
+Schedule.hourly(minute=15)
+
+# Fixed interval
+Schedule.every("30m")
+
+# CDC-triggered (when source changes)
+Schedule.on_change(sources=["clickstream"])
+
+# Manual only
+Schedule.manual()
+```
+
+### Incremental Processing
+
+```python
+from raise_ import IncrementalConfig
+
+# Full refresh (recompute everything)
+IncrementalConfig.full()
+
+# Timestamp-based incremental
+IncrementalConfig.incremental(
+    checkpoint_column="event_timestamp",
+    lookback="1h",  # Handle late-arriving data
+)
+
+# Append-only
+IncrementalConfig.append(checkpoint_column="id")
+
+# Upsert with keys
+IncrementalConfig.upsert(
+    key_columns=["user_id", "date"],
+    checkpoint_column="updated_at",
+)
+```
+
+### Quality Checks
+
+```python
+from raise_ import NullCheck, RangeCheck, RowCountCheck
+
+# Check for nulls
+null_check = NullCheck(
+    name="check_user_id",
+    column="user_id",
+    max_null_rate=0.0,  # No nulls allowed
+)
+
+# Check value range
+range_check = RangeCheck(
+    name="check_ctr",
+    column="click_through_rate",
+    min_value=0.0,
+    max_value=1.0,
+)
+
+# Check row count
+count_check = RowCountCheck(
+    name="check_minimum_rows",
+    min_rows=1000,
+)
+```
+
+### Airflow Integration
+
+```python
+from raise_ import AirflowConfig, generate_airflow_dag
+
+# Configure Airflow
+fs.transforms.use_airflow(
+    config=AirflowConfig(
+        dag_folder="/opt/airflow/dags",
+        catchup=False,
+        max_active_runs=1,
+        tags=["raise", "feature-store"],
+    ),
+    airflow_url="http://airflow.example.com",
+)
+
+# Deploy job as Airflow DAG
+result = fs.deploy_job(job)
+print(f"DAG URL: {result.url}")
+
+# Generate DAG code without deploying
+dag_code = fs.transforms.generate_dag(job)
+```
+
+---
+
 ## API Reference
 
 ### FeatureStore
@@ -1101,6 +1353,14 @@ class FeatureStore:
     def create_dashboard(self, name: str, description: str = None) -> Dashboard
     def create_alert(self, name: str, analysis: Analysis, condition: Condition, ...) -> AnalyticsAlert
     def list_alerts(self) -> list[AnalyticsAlert]
+
+    # Transforms
+    transforms: TransformsClient
+    def create_job(self, name: str, sources: list[Source], transform: Transform, target: str, ...) -> Job
+    def get_job(self, name: str) -> Job
+    def list_jobs(self, status: str = None, tags: list[str] = None) -> list[Job]
+    def deploy_job(self, job: Job | str) -> DeploymentResult
+    def trigger_job(self, job: Job | str) -> str
 ```
 
 ### FeatureGroup
