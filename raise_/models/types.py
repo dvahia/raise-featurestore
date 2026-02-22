@@ -212,6 +212,66 @@ class Struct(FeatureType):
         return all(self_fields[k].is_compatible(other_fields[k]) for k in self_fields)
 
 
+@dataclass(frozen=True)
+class BlobRef(FeatureType):
+    """
+    Reference to a multimodal blob (image, audio, video, etc.).
+
+    Stores a reference to external binary data rather than the data itself.
+    This enables efficient handling of large multimodal assets where only
+    metadata and references need to be moved during transformations.
+
+    Args:
+        content_types: Optional list of allowed MIME types (e.g., ["image/png", "image/jpeg"]).
+                      If None, any content type is allowed.
+        registry: Name of the blob registry to use for validation (default: "default").
+        validate_on_write: Whether to validate blob existence on write (default: True).
+
+    Examples:
+        >>> # Any blob type
+        >>> BlobRef()
+
+        >>> # Only images
+        >>> BlobRef(content_types=["image/png", "image/jpeg"])
+
+        >>> # Video with specific registry
+        >>> BlobRef(content_types=["video/mp4"], registry="video-store")
+    """
+
+    content_types: tuple[str, ...] | None = None
+    registry: str = "default"
+    validate_on_write: bool = True
+
+    def __post_init__(self):
+        # Convert list to tuple for immutability/hashing
+        if isinstance(self.content_types, list):
+            object.__setattr__(self, "content_types", tuple(self.content_types))
+
+    def to_string(self) -> str:
+        if self.content_types:
+            types_str = "|".join(self.content_types)
+            return f"blob_ref<{types_str}>"
+        return "blob_ref"
+
+    def is_compatible(self, other: FeatureType) -> bool:
+        if not isinstance(other, BlobRef):
+            return False
+        # If this type allows any content, it's compatible
+        if self.content_types is None:
+            return True
+        # If other allows any content but this doesn't, not compatible
+        if other.content_types is None:
+            return False
+        # Check if other's allowed types are a subset of ours
+        return set(other.content_types).issubset(set(self.content_types))
+
+    def accepts(self, content_type: str) -> bool:
+        """Check if this type accepts a specific content type."""
+        if self.content_types is None:
+            return True
+        return content_type in self.content_types
+
+
 # Type string pattern matching
 _TYPE_PATTERNS = {
     r"^int64$": lambda m: Int64(),
@@ -227,6 +287,8 @@ _TYPE_PATTERNS = {
     r"^(int64|float32|float64)\[:(\d+)\]$": lambda m: Array(
         element_type=parse_dtype(m.group(1)), max_length=int(m.group(2))
     ),
+    r"^blob_ref$": lambda m: BlobRef(),
+    r"^blob_ref<([^>]+)>$": lambda m: BlobRef(content_types=tuple(t.strip() for t in m.group(1).split("|"))),
 }
 
 
@@ -263,7 +325,8 @@ def parse_dtype(dtype: str | FeatureType) -> FeatureType:
 
     raise ValueError(
         f"Unknown dtype: '{dtype}'. Supported types: int64, float32, float64, bool, "
-        f"string, string[N], bytes, timestamp, float32[N] (embedding), type[] (array)"
+        f"string, string[N], bytes, timestamp, float32[N] (embedding), type[] (array), "
+        f"blob_ref, blob_ref<mime/type> (multimodal reference)"
     )
 
 

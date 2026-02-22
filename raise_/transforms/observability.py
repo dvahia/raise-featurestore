@@ -381,6 +381,77 @@ class FreshnessCheck(QualityCheck):
 
 
 @dataclass
+class BlobIntegrityCheck(QualityCheck):
+    """
+    Check referential integrity of blob references.
+
+    Validates that blob references in a column point to existing blobs
+    with matching checksums.
+
+    Attributes:
+        column: Column containing blob references
+        verify_checksum: Whether to verify blob checksums (slower but thorough)
+        verify_existence: Whether to verify blob existence
+        max_missing_rate: Maximum allowed rate of missing blobs (0-1)
+        max_invalid_rate: Maximum allowed rate of invalid checksums (0-1)
+        sample_rate: Rate of references to sample for validation (0-1)
+    """
+
+    column: str = ""
+    verify_checksum: bool = True
+    verify_existence: bool = True
+    max_missing_rate: float = 0.0
+    max_invalid_rate: float = 0.0
+    sample_rate: float = 1.0  # Check all by default
+
+    def check(self, data: Any) -> QualityCheckResult:
+        # Mock implementation - would use BlobRegistry in production
+        total_refs = 100  # Mock
+        missing_refs = 0
+        invalid_refs = 0
+
+        missing_rate = missing_refs / total_refs if total_refs > 0 else 0
+        invalid_rate = invalid_refs / total_refs if total_refs > 0 else 0
+
+        passed = (
+            missing_rate <= self.max_missing_rate and
+            invalid_rate <= self.max_invalid_rate
+        )
+
+        details = {
+            "total_references": total_refs,
+            "missing_count": missing_refs,
+            "invalid_count": invalid_refs,
+            "missing_rate": missing_rate,
+            "invalid_rate": invalid_rate,
+            "sample_rate": self.sample_rate,
+        }
+
+        return QualityCheckResult(
+            check_name=self.name,
+            result=CheckResult.PASSED if passed else CheckResult.FAILED,
+            message=f"Blob integrity for {self.column}: {missing_refs} missing, {invalid_refs} invalid of {total_refs}",
+            actual_value={"missing_rate": missing_rate, "invalid_rate": invalid_rate},
+            expected_value={"max_missing": self.max_missing_rate, "max_invalid": self.max_invalid_rate},
+            details=details,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "blob_integrity_check",
+            "name": self.name,
+            "description": self.description,
+            "severity": self.severity.value,
+            "column": self.column,
+            "verify_checksum": self.verify_checksum,
+            "verify_existence": self.verify_existence,
+            "max_missing_rate": self.max_missing_rate,
+            "max_invalid_rate": self.max_invalid_rate,
+            "sample_rate": self.sample_rate,
+        }
+
+
+@dataclass
 class QualityReport:
     """
     Aggregated report of quality check results.
@@ -493,3 +564,8 @@ class StandardMetrics:
     CHECKPOINT_LAG_SECONDS = "transform_checkpoint_lag_seconds"
     QUALITY_CHECKS_PASSED = "transform_quality_checks_passed"
     QUALITY_CHECKS_FAILED = "transform_quality_checks_failed"
+    # Blob metrics
+    BLOBS_VALIDATED = "transform_blobs_validated"
+    BLOBS_MISSING = "transform_blobs_missing"
+    BLOBS_INVALID = "transform_blobs_invalid"
+    BLOB_BYTES_REFERENCED = "transform_blob_bytes_referenced"

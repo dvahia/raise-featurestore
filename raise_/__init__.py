@@ -26,6 +26,7 @@ from raise_.models.types import (
     Embedding,
     Array,
     Struct,
+    BlobRef,
 )
 from raise_.validation import ValidationResult, ValidationError, ValidationWarning
 from raise_.analytics import (
@@ -77,6 +78,14 @@ from raise_.transforms import (
     UniqueCheck,
     RangeCheck,
     RowCountCheck,
+    BlobIntegrityCheck,
+    # Multimodal
+    BlobReference,
+    BlobRegistry,
+    ContentType,
+    IntegrityPolicy,
+    MultimodalSource,
+    create_reference,
 )
 from raise_.exceptions import (
     RaiseError,
@@ -117,6 +126,7 @@ __all__ = [
     "Embedding",
     "Array",
     "Struct",
+    "BlobRef",
     # Validation
     "ValidationResult",
     "ValidationError",
@@ -163,6 +173,14 @@ __all__ = [
     "UniqueCheck",
     "RangeCheck",
     "RowCountCheck",
+    "BlobIntegrityCheck",
+    # Multimodal
+    "BlobReference",
+    "BlobRegistry",
+    "ContentType",
+    "IntegrityPolicy",
+    "MultimodalSource",
+    "create_reference",
     # Exceptions
     "RaiseError",
     "FeatureExistsError",

@@ -68,6 +68,7 @@ from raise_.transforms.observability import (
     RowCountCheck,
     CustomCheck,
     FreshnessCheck,
+    BlobIntegrityCheck,
     QualityReport,
     JobMetrics,
     StandardMetrics,
@@ -88,6 +89,28 @@ from raise_.transforms.airflow import (
 )
 
 from raise_.transforms.client import TransformsClient
+
+from raise_.transforms.multimodal import (
+    # Core types
+    BlobReference,
+    BlobRegistry,
+    BlobStatus,
+    ContentType,
+    HashAlgorithm,
+    # Integrity
+    IntegrityMode,
+    IntegrityPolicy,
+    IntegrityError,
+    ValidationResult,
+    ReferenceNotFoundError,
+    # Sources
+    MultimodalSource,
+    MultimodalContext,
+    BlobReferenceType,
+    # Utilities
+    create_reference,
+    infer_content_type,
+)
 
 
 __all__ = [
@@ -145,6 +168,7 @@ __all__ = [
     "RowCountCheck",
     "CustomCheck",
     "FreshnessCheck",
+    "BlobIntegrityCheck",
     "QualityReport",
     "JobMetrics",
     "StandardMetrics",
@@ -159,4 +183,20 @@ __all__ = [
     "generate_airflow_dag",
     # Client
     "TransformsClient",
+    # Multimodal
+    "BlobReference",
+    "BlobRegistry",
+    "BlobStatus",
+    "ContentType",
+    "HashAlgorithm",
+    "IntegrityMode",
+    "IntegrityPolicy",
+    "IntegrityError",
+    "ValidationResult",
+    "ReferenceNotFoundError",
+    "MultimodalSource",
+    "MultimodalContext",
+    "BlobReferenceType",
+    "create_reference",
+    "infer_content_type",
 ]
