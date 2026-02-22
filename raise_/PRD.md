@@ -1,9 +1,10 @@
 # Raise Feature Store - Product Requirements Document
 
-**Version:** 1.1
+**Version:** 1.2
 **Status:** Ready for Engineering Review
 **Last Updated:** 2026-02-21
 
+> **v1.2 Changes:** Added Multimodal Data Support (Section 17)
 > **v1.1 Changes:** Added ETL/Transformations (Section 15) and Airflow Integration (Section 16)
 
 ---
@@ -34,11 +35,12 @@ This PRD defines the backend systems and middleware required to support the Rais
 14. [Alerting System](#14-alerting-system)
 15. [ETL and Transformations](#15-etl-and-transformations)
 16. [Airflow Integration](#16-airflow-integration)
-17. [Storage Requirements](#17-storage-requirements)
-18. [API Layer](#18-api-layer)
-19. [Non-Functional Requirements](#19-non-functional-requirements)
-20. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
-21. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
+17. [Multimodal Data Support](#17-multimodal-data-support)
+18. [Storage Requirements](#18-storage-requirements)
+19. [API Layer](#19-api-layer)
+20. [Non-Functional Requirements](#20-non-functional-requirements)
+21. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
+22. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
 
 ---
 
@@ -1719,9 +1721,341 @@ class Orchestrator(ABC):
 
 ---
 
-## 17. Storage Requirements
+## 17. Multimodal Data Support
 
-### 17.1 Metadata Store
+### 17.1 Overview
+
+Multimodal data support enables the feature store to handle references to large binary assets (images, audio, video, ML tensors) without moving the actual data bytes. This is critical for ML workflows where multimodal data is stored in blob storage but needs to be tracked, validated, and linked to feature records.
+
+**Key Design Principles:**
+- References, not data: Only metadata and references move through pipelines
+- Referential integrity: Ensure references remain valid over time
+- Content type awareness: Support for various multimodal formats
+- Checksum verification: Integrity validation via cryptographic hashes
+- Registry tracking: Centralized management of blob references
+
+### 17.2 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Multimodal Data Flow                          │
+│                                                                   │
+│  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐     │
+│  │    Blob     │      │    Blob     │      │   Feature   │     │
+│  │   Storage   │──────│  Registry   │──────│    Store    │     │
+│  │  (S3/GCS)   │      │             │      │             │     │
+│  └─────────────┘      └─────────────┘      └─────────────┘     │
+│        │                     │                     │            │
+│        │    ┌────────────────┼────────────────┐   │            │
+│        │    │                │                │   │            │
+│        ▼    ▼                ▼                ▼   ▼            │
+│  ┌─────────────────────────────────────────────────────┐       │
+│  │              BlobReference                           │       │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐  │       │
+│  │  │   URI   │ │Checksum │ │ Content │ │Metadata │  │       │
+│  │  │         │ │         │ │  Type   │ │         │  │       │
+│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘  │       │
+│  └─────────────────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 17.3 Blob Reference Data Model
+
+#### BlobReference Structure
+
+```python
+@dataclass(frozen=True)
+class BlobReference:
+    uri: str                          # s3://bucket/path/file.png
+    content_type: ContentType | str   # image/png, audio/wav, etc.
+    checksum: str                     # SHA256 hash of content
+    hash_algorithm: HashAlgorithm     # SHA256, SHA512, MD5, BLAKE3, XXH3
+    size_bytes: int                   # Size in bytes
+    etag: str | None                  # Object storage ETag
+    version_id: str | None            # Version identifier
+    created_at: datetime              # Creation timestamp
+    metadata: dict[str, Any]          # Additional metadata
+```
+
+#### Database Schema
+
+```sql
+CREATE TABLE blob_references (
+    id UUID PRIMARY KEY,
+    registry_id UUID NOT NULL REFERENCES blob_registries(id),
+    uri VARCHAR(2048) NOT NULL,
+    content_type VARCHAR(128) NOT NULL,
+    checksum VARCHAR(256) NOT NULL,
+    hash_algorithm VARCHAR(32) NOT NULL DEFAULT 'sha256',
+    size_bytes BIGINT NOT NULL DEFAULT 0,
+    etag VARCHAR(256),
+    version_id VARCHAR(256),
+    metadata JSONB DEFAULT '{}',
+    status VARCHAR(32) DEFAULT 'valid',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    validated_at TIMESTAMP,
+    UNIQUE(registry_id, uri, checksum)
+);
+
+CREATE INDEX idx_blob_refs_uri ON blob_references(uri);
+CREATE INDEX idx_blob_refs_content_type ON blob_references(content_type);
+CREATE INDEX idx_blob_refs_status ON blob_references(status);
+
+CREATE TABLE blob_registries (
+    id UUID PRIMARY KEY,
+    org_id UUID NOT NULL REFERENCES organizations(id),
+    name VARCHAR(128) NOT NULL,
+    integrity_policy JSONB NOT NULL DEFAULT '{"mode": "on_write"}',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE(org_id, name)
+);
+```
+
+### 17.4 Content Types
+
+| Category | Content Types | MIME Type |
+|----------|---------------|-----------|
+| **Images** | PNG, JPEG, WebP, TIFF, BMP, GIF | `image/png`, `image/jpeg`, etc. |
+| **Audio** | WAV, MP3, FLAC, OGG, AAC | `audio/wav`, `audio/mpeg`, etc. |
+| **Video** | MP4, WebM, AVI, MOV | `video/mp4`, `video/webm`, etc. |
+| **Documents** | PDF | `application/pdf` |
+| **3D/Point Clouds** | PLY, OBJ, GLTF | `model/ply`, `model/obj`, etc. |
+| **ML Tensors** | NumPy, PyTorch, SafeTensors | `application/x-numpy`, `application/x-pytorch`, etc. |
+
+### 17.5 BlobRef Feature Type
+
+A new feature type for storing blob references in feature columns:
+
+```sql
+-- Type specification
+"blob_ref"                              -- Any content type
+"blob_ref<image/png|image/jpeg>"        -- Constrained to specific types
+"blob_ref<audio/wav|audio/mp3>"         -- Audio only
+```
+
+#### Storage Mapping
+
+```sql
+-- Feature column stores serialized BlobReference
+CREATE TABLE feature_data (
+    ...
+    image_ref JSONB,  -- Stores {"uri": "...", "checksum": "...", ...}
+    ...
+);
+```
+
+### 17.6 Blob Registry
+
+The Blob Registry provides centralized tracking and validation of blob references.
+
+#### Registry Operations
+
+| Operation | Description | Backend Action |
+|-----------|-------------|----------------|
+| `register` | Register new blob reference | Insert with optional validation |
+| `get` | Retrieve by registry ID | Query by ID |
+| `get_by_uri` | Retrieve by URI | Query by URI |
+| `validate` | Validate reference integrity | Check blob exists + checksum |
+| `validate_batch` | Validate multiple references | Batch validation |
+| `list_references` | List with filters | Query with filters |
+| `find_orphans` | Find missing blobs | Validate all, return missing |
+| `delete` | Remove reference | Delete from registry |
+
+### 17.7 Integrity Validation
+
+#### Integrity Modes
+
+| Mode | Description | Performance | Use Case |
+|------|-------------|-------------|----------|
+| `STRICT` | Validate on every access | Slowest | High-security data |
+| `ON_WRITE` | Validate on create/update | Moderate | Default for most cases |
+| `ON_READ` | Validate when reading | Moderate | Read-heavy workloads |
+| `LAZY` | Validate only on explicit check | Fastest | Large-scale processing |
+| `PERIODIC` | Background validation jobs | Background | Long-term integrity |
+
+#### Validation Process
+
+```
+1. Resolve URI to storage backend (S3, GCS, etc.)
+2. Check blob existence (HEAD request)
+3. If verify_checksum:
+   a. Download blob content
+   b. Compute checksum
+   c. Compare with stored checksum
+4. If verify_size:
+   a. Compare Content-Length with stored size
+5. Return ValidationResult with status
+```
+
+#### Validation Result Schema
+
+```sql
+CREATE TABLE blob_validations (
+    id UUID PRIMARY KEY,
+    reference_id UUID NOT NULL REFERENCES blob_references(id),
+    status VARCHAR(32) NOT NULL,  -- valid, missing, invalid, expired
+    valid BOOLEAN NOT NULL,
+    message TEXT,
+    actual_checksum VARCHAR(256),
+    actual_size BIGINT,
+    checked_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_validations_ref ON blob_validations(reference_id);
+CREATE INDEX idx_validations_status ON blob_validations(status);
+```
+
+### 17.8 Multimodal Sources
+
+Scan object storage for multimodal assets and produce BlobReferences.
+
+```python
+MultimodalSource(
+    name="product_images",
+    uri_prefix="s3://bucket/images/",
+    content_types=[ContentType.IMAGE_JPEG, ContentType.IMAGE_PNG],
+    registry=registry,
+    compute_checksums=True,
+    hash_algorithm=HashAlgorithm.SHA256,
+    recursive=True,
+    glob_pattern="*.{jpg,png}",
+)
+```
+
+#### Scan Process
+
+```
+1. List objects at uri_prefix (with pagination)
+2. Filter by content type (extension or Content-Type header)
+3. For each matching object:
+   a. Get object metadata (size, etag, last_modified)
+   b. If compute_checksums: download and hash
+   c. Create BlobReference
+   d. Register in registry (if provided)
+4. Return list of BlobReferences
+```
+
+### 17.9 Blob Integrity Check (Quality Check)
+
+Quality check for validating blob references in transformation pipelines.
+
+```python
+BlobIntegrityCheck(
+    name="check_image_integrity",
+    column="image_ref",
+    verify_checksum=True,
+    verify_existence=True,
+    max_missing_rate=0.01,  # Allow 1% missing
+    max_invalid_rate=0.0,   # No invalid checksums
+    sample_rate=1.0,        # Check all (or sample for large datasets)
+    severity=CheckSeverity.ERROR,
+)
+```
+
+#### Check Logic
+
+```
+1. Extract blob references from column
+2. If sample_rate < 1.0: sample references
+3. For each reference:
+   a. Validate existence
+   b. If verify_checksum: validate checksum
+4. Compute rates:
+   a. missing_rate = missing_count / total_count
+   b. invalid_rate = invalid_count / total_count
+5. Pass if:
+   a. missing_rate <= max_missing_rate
+   b. invalid_rate <= max_invalid_rate
+```
+
+### 17.10 Hash Algorithms
+
+| Algorithm | Speed | Security | Use Case |
+|-----------|-------|----------|----------|
+| `SHA256` | Moderate | High | Default, recommended |
+| `SHA512` | Slower | Higher | High-security requirements |
+| `MD5` | Fast | Low | Legacy compatibility only |
+| `BLAKE3` | Very Fast | High | Large files, modern systems |
+| `XXH3` | Fastest | Low | Non-cryptographic integrity |
+
+### 17.11 API Endpoints
+
+```
+# Blob Registries
+GET    /v1/blob-registries
+POST   /v1/blob-registries
+GET    /v1/blob-registries/{name}
+DELETE /v1/blob-registries/{name}
+
+# Blob References
+GET    /v1/blob-registries/{registry}/references
+POST   /v1/blob-registries/{registry}/references
+POST   /v1/blob-registries/{registry}/references/batch
+GET    /v1/blob-registries/{registry}/references/{id}
+DELETE /v1/blob-registries/{registry}/references/{id}
+GET    /v1/blob-registries/{registry}/references/by-uri?uri={uri}
+
+# Validation
+POST   /v1/blob-registries/{registry}/references/{id}/validate
+POST   /v1/blob-registries/{registry}/validate-batch
+GET    /v1/blob-registries/{registry}/orphans
+
+# Multimodal Sources
+POST   /v1/multimodal-sources/scan
+```
+
+### 17.12 Storage Integration
+
+#### S3 Integration
+
+```python
+def validate_s3_blob(ref: BlobReference) -> ValidationResult:
+    s3 = boto3.client('s3')
+    bucket, key = parse_s3_uri(ref.uri)
+
+    try:
+        # Check existence
+        head = s3.head_object(Bucket=bucket, Key=key)
+
+        # Verify size
+        actual_size = head['ContentLength']
+
+        # Verify checksum (if needed)
+        if verify_checksum:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            actual_checksum = compute_checksum(obj['Body'].read())
+
+        return ValidationResult(
+            status=BlobStatus.VALID if checksum_matches else BlobStatus.INVALID,
+            ...
+        )
+    except s3.exceptions.NoSuchKey:
+        return ValidationResult(status=BlobStatus.MISSING, ...)
+```
+
+#### GCS / Azure Blob Integration
+
+Similar patterns for Google Cloud Storage and Azure Blob Storage using respective SDKs.
+
+### 17.13 Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `blob_references_total` | Counter | Total registered references |
+| `blob_validations_total` | Counter | Total validations performed |
+| `blob_validations_failed` | Counter | Failed validations |
+| `blob_missing_rate` | Gauge | Current missing blob rate |
+| `blob_invalid_rate` | Gauge | Current invalid checksum rate |
+| `blob_bytes_referenced` | Counter | Total bytes referenced |
+| `blob_scan_duration_seconds` | Histogram | Source scan duration |
+| `blob_validation_duration_seconds` | Histogram | Validation duration |
+
+---
+
+## 18. Storage Requirements
+
+### 18.1 Metadata Store
 
 **Technology:** PostgreSQL 14+
 
@@ -1737,7 +2071,7 @@ class Orchestrator(ABC):
 - ~500B per audit entry
 - Estimate: 100K features = 100MB metadata + 10GB audit/year
 
-### 15.2 Feature Data Store
+### 18.2 Feature Data Store
 
 **Technology:** Columnar storage (Parquet on S3/GCS, Delta Lake, or Apache Iceberg)
 
@@ -1753,7 +2087,7 @@ class Orchestrator(ABC):
 - Embeddings: 4 bytes * dimensions * rows
 - Estimate: 1M users * 512-dim embedding = 2GB per feature
 
-### 15.3 Analytics Cache
+### 18.3 Analytics Cache
 
 **Technology:** Redis Cluster
 
@@ -1767,7 +2101,7 @@ class Orchestrator(ABC):
 - ~10KB per cached result
 - Estimate: 10K active analyses * 10KB = 100MB
 
-### 15.4 Lineage Graph Store
+### 18.4 Lineage Graph Store
 
 **Options:**
 
@@ -1779,7 +2113,7 @@ class Orchestrator(ABC):
 
 **Recommendation:** Start with PostgreSQL + recursive CTEs, migrate to Neo4j if lineage graphs become very deep (>100 levels).
 
-### 15.5 Blob Storage
+### 18.5 Blob Storage
 
 **Technology:** S3 / GCS / Azure Blob
 
@@ -1789,7 +2123,7 @@ class Orchestrator(ABC):
 - Dashboard snapshots
 - Large analysis results
 
-### 15.6 Message Queue
+### 18.6 Message Queue
 
 **Technology:** Kafka / SQS / Pub/Sub
 
@@ -1801,9 +2135,9 @@ class Orchestrator(ABC):
 
 ---
 
-## 18. API Layer
+## 19. API Layer
 
-### 16.1 REST API Endpoints
+### 19.1 REST API Endpoints
 
 #### Organizations
 ```
@@ -1946,13 +2280,13 @@ GET    /v1/jobs/{name}/lineage
 GET    /v1/jobs/{name}/dag
 ```
 
-### 18.2 Authentication
+### 19.2 Authentication
 
 - OAuth2 / OIDC for user authentication
 - API keys for service-to-service
 - JWT tokens with org/user claims
 
-### 18.3 Rate Limiting
+### 19.3 Rate Limiting
 
 | Tier | Requests/min | Concurrent Jobs |
 |------|--------------|-----------------|
@@ -1960,7 +2294,7 @@ GET    /v1/jobs/{name}/dag
 | Standard | 1000 | 10 |
 | Enterprise | 10000 | 100 |
 
-### 18.4 Error Responses
+### 19.4 Error Responses
 
 ```json
 {
@@ -1977,9 +2311,9 @@ GET    /v1/jobs/{name}/dag
 
 ---
 
-## 19. Non-Functional Requirements
+## 20. Non-Functional Requirements
 
-### 19.1 Performance
+### 20.1 Performance
 
 | Operation | Target Latency (p99) |
 |-----------|---------------------|
@@ -1992,14 +2326,14 @@ GET    /v1/jobs/{name}/dag
 | Live table query | < 200ms |
 | Dashboard render | < 2s |
 
-### 19.2 Availability
+### 20.2 Availability
 
 - **Target SLA:** 99.9% (8.76 hours downtime/year)
 - **Metadata store:** Multi-AZ deployment
 - **Analytics:** Graceful degradation (serve cached results)
 - **CDC:** At-least-once delivery
 
-### 19.3 Scalability
+### 20.3 Scalability
 
 | Dimension | Initial | Scale Target |
 |-----------|---------|--------------|
@@ -2009,7 +2343,7 @@ GET    /v1/jobs/{name}/dag
 | Analytics jobs/day | 1,000 | 1,000,000 |
 | Audit events/day | 100,000 | 100,000,000 |
 
-### 19.4 Security
+### 20.4 Security
 
 - **Encryption at rest:** AES-256 for all data stores
 - **Encryption in transit:** TLS 1.3 for all connections
@@ -2017,14 +2351,14 @@ GET    /v1/jobs/{name}/dag
 - **Audit:** All access logged, immutable audit trail
 - **Network:** VPC isolation, private endpoints
 
-### 19.5 Compliance
+### 20.5 Compliance
 
 - **Data residency:** Support region-specific deployment
 - **Data retention:** Configurable per organization
 - **Right to deletion:** Support GDPR/CCPA data removal
 - **Audit export:** SOC2/ISO27001 compliant exports
 
-### 19.6 Disaster Recovery
+### 20.6 Disaster Recovery
 
 - **RPO:** 1 hour (point-in-time recovery)
 - **RTO:** 4 hours (full service restoration)
@@ -2183,6 +2517,8 @@ RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-02-21 | API Design Team | Initial PRD |
+| 1.1 | 2026-02-21 | API Design Team | Added ETL/Transformations (Section 15) and Airflow Integration (Section 16) |
+| 1.2 | 2026-02-21 | API Design Team | Added Multimodal Data Support (Section 17) |
 
 ---
 
