@@ -61,6 +61,13 @@ user_signals.create_feature(
   - [Incremental Processing](#incremental-processing)
   - [Quality Checks](#quality-checks)
   - [Airflow Integration](#airflow-integration)
+- [Multimodal Data](#multimodal-data)
+  - [Blob References](#blob-references)
+  - [BlobRef Feature Type](#blobref-feature-type)
+  - [Blob Registry](#blob-registry)
+  - [Multimodal Sources](#multimodal-sources)
+  - [Integrity Validation](#integrity-validation)
+  - [Blob Integrity Checks](#blob-integrity-checks)
 - [API Reference](#api-reference)
 
 ---
@@ -1310,6 +1317,339 @@ dag_code = fs.transforms.generate_dag(job)
 
 ---
 
+## Multimodal Data
+
+Raise supports multimodal data (images, audio, video, etc.) through blob references. References allow transformations to work with metadata without moving the actual data bytes, which is critical for large assets.
+
+### Blob References
+
+A `BlobReference` is an immutable reference to a multimodal blob with integrity metadata.
+
+```python
+from raise_ import BlobReference, BlobRegistry, ContentType, create_reference
+
+# Create a registry for tracking references
+registry = BlobRegistry(name="product-images")
+
+# Register a blob reference
+ref = registry.register(
+    uri="s3://products/images/product-001.png",
+    content_type=ContentType.IMAGE_PNG,
+    checksum="abc123def456...",
+    size_bytes=1024000,
+    metadata={
+        "width": 1920,
+        "height": 1080,
+        "color_space": "sRGB",
+    },
+)
+
+print(ref.uri)           # s3://products/images/product-001.png
+print(ref.scheme)        # s3
+print(ref.bucket)        # products
+print(ref.key)           # images/product-001.png
+print(ref.is_image)      # True
+print(ref.size_bytes)    # 1024000
+
+# Convenience function
+ref = create_reference(
+    uri="s3://bucket/audio.wav",
+    content_type="audio/wav",
+    checksum="def789...",
+)
+```
+
+#### Reference Properties
+
+| Property | Description |
+|----------|-------------|
+| `uri` | Full URI to the blob |
+| `content_type` | MIME type (ContentType enum or string) |
+| `checksum` | Content hash for integrity |
+| `hash_algorithm` | Algorithm used (SHA256, SHA512, MD5, etc.) |
+| `size_bytes` | Size in bytes |
+| `etag` | Object storage ETag |
+| `version_id` | Version identifier |
+| `scheme` | URI scheme (s3, gs, az, file) |
+| `bucket` | Bucket name for object storage |
+| `key` | Object key for object storage |
+| `is_image` | True if content type is image/* |
+| `is_audio` | True if content type is audio/* |
+| `is_video` | True if content type is video/* |
+
+### BlobRef Feature Type
+
+Use `BlobRef` to define feature columns that store blob references.
+
+```python
+from raise_ import FeatureStore, BlobRef
+
+fs = FeatureStore("acme/mlplatform/vision")
+
+# Create feature group with blob reference columns
+image_features = fs.create_feature_group("image-features")
+
+image_features.create_features_from_schema({
+    "product_id": "string",
+    "image_ref": BlobRef(content_types=["image/png", "image/jpeg"]),
+    "thumbnail_ref": BlobRef(content_types=["image/jpeg"]),
+    "embedding": "float32[512]",
+})
+```
+
+#### String Syntax
+
+```python
+# Any blob type
+"blob_ref"
+
+# Constrained to specific content types
+"blob_ref<image/png|image/jpeg>"
+"blob_ref<audio/wav|audio/mp3|audio/flac>"
+"blob_ref<video/mp4>"
+```
+
+#### Typed Constructor
+
+```python
+from raise_ import BlobRef
+
+# Any content type
+BlobRef()
+
+# Only images
+BlobRef(content_types=["image/png", "image/jpeg"])
+
+# With registry and validation settings
+BlobRef(
+    content_types=["video/mp4", "video/webm"],
+    registry="video-store",
+    validate_on_write=True,
+)
+
+# Check if type accepts a content type
+image_type = BlobRef(content_types=["image/png", "image/jpeg"])
+image_type.accepts("image/png")   # True
+image_type.accepts("video/mp4")   # False
+```
+
+### Blob Registry
+
+The `BlobRegistry` tracks and validates blob references.
+
+```python
+from raise_ import BlobRegistry, IntegrityPolicy
+
+# Create registry with integrity policy
+registry = BlobRegistry(
+    name="product-images",
+    policy=IntegrityPolicy.on_write(),
+)
+
+# Register references
+ref = registry.register(
+    uri="s3://bucket/image.png",
+    content_type="image/png",
+    checksum="abc123...",
+)
+
+# Get by registry ID or URI
+ref = registry.get(registry_id)
+ref = registry.get_by_uri("s3://bucket/image.png")
+
+# List references with filtering
+all_refs = registry.list_references()
+png_refs = registry.list_references(content_type=ContentType.IMAGE_PNG)
+s3_refs = registry.list_references(prefix="s3://bucket/")
+
+# Find orphaned references (blobs that no longer exist)
+orphans = registry.find_orphans()
+
+# Compute checksums
+checksum = registry.compute_checksum(data, HashAlgorithm.SHA256)
+```
+
+### Multimodal Sources
+
+Scan object storage for multimodal assets and get references (not data).
+
+```python
+from raise_ import MultimodalSource, ContentType
+
+# Create source for scanning images
+source = MultimodalSource(
+    name="product_images",
+    uri_prefix="s3://products/images/",
+    content_types=[ContentType.IMAGE_JPEG, ContentType.IMAGE_PNG],
+    registry=registry,
+    compute_checksums=True,
+    recursive=True,
+)
+
+# Scan returns BlobReferences, not actual data
+refs = source.scan()
+for ref in refs:
+    print(f"{ref.uri} - {ref.content_type}")
+
+# Get reference for specific file
+ref = source.get_reference("product-001.png")
+```
+
+### Integrity Validation
+
+Configure when and how referential integrity is enforced.
+
+```python
+from raise_ import IntegrityPolicy, IntegrityMode
+
+# Validate on every access
+strict = IntegrityPolicy.strict()
+
+# Validate only when creating/updating references (default)
+on_write = IntegrityPolicy.on_write()
+
+# Validate only on explicit check
+lazy = IntegrityPolicy.lazy()
+
+# Custom policy
+policy = IntegrityPolicy(
+    mode=IntegrityMode.ON_WRITE,
+    fail_on_missing=True,
+    fail_on_mismatch=True,
+    cache_validation_seconds=3600,
+)
+
+# Validate a reference
+result = registry.validate(ref)
+print(result.status)           # BlobStatus.VALID
+print(result.valid)            # True
+print(result.checksum_matches) # True
+print(result.size_matches)     # True
+
+# Batch validation
+results = registry.validate_batch(refs)
+```
+
+#### Integrity Modes
+
+| Mode | Description |
+|------|-------------|
+| `STRICT` | Validate on every access |
+| `ON_WRITE` | Validate when creating/updating references |
+| `ON_READ` | Validate when reading/resolving references |
+| `LAZY` | Validate only on explicit check |
+| `PERIODIC` | Background validation jobs |
+
+### Blob Integrity Checks
+
+Quality check for validating blob references in transformation pipelines.
+
+```python
+from raise_ import BlobIntegrityCheck
+from raise_.transforms import CheckSeverity
+
+# Create integrity check
+check = BlobIntegrityCheck(
+    name="check_image_integrity",
+    column="image_ref",
+    verify_checksum=True,
+    verify_existence=True,
+    max_missing_rate=0.01,  # Allow 1% missing
+    max_invalid_rate=0.0,   # No invalid checksums
+    sample_rate=1.0,        # Check all references
+    severity=CheckSeverity.ERROR,
+)
+
+# Run the check
+result = check.check(data)
+print(result.result)   # CheckResult.PASSED
+print(result.details)  # {"total_references": 100, "missing_count": 0, ...}
+```
+
+### Content Types
+
+Raise supports many multimodal content types.
+
+| Category | Content Types |
+|----------|---------------|
+| **Images** | `image/png`, `image/jpeg`, `image/webp`, `image/tiff`, `image/bmp`, `image/gif` |
+| **Audio** | `audio/wav`, `audio/mpeg` (MP3), `audio/flac`, `audio/ogg`, `audio/aac` |
+| **Video** | `video/mp4`, `video/webm`, `video/avi`, `video/quicktime` (MOV) |
+| **Documents** | `application/pdf` |
+| **3D/Point Clouds** | `model/ply`, `model/obj`, `model/gltf+json` |
+| **ML Tensors** | `application/x-numpy` (NPY), `application/x-numpy-compressed` (NPZ), `application/x-pytorch` (PT), `application/x-safetensors` |
+
+```python
+from raise_.transforms import ContentType, infer_content_type
+
+# Use enum
+ContentType.IMAGE_PNG
+ContentType.AUDIO_WAV
+ContentType.TENSOR_SAFETENSORS
+
+# Infer from URI
+content_type = infer_content_type("s3://bucket/image.png")  # ContentType.IMAGE_PNG
+content_type = infer_content_type("data/model.safetensors")  # ContentType.TENSOR_SAFETENSORS
+```
+
+### Hash Algorithms
+
+```python
+from raise_.transforms import HashAlgorithm
+
+# Supported algorithms
+HashAlgorithm.SHA256   # Default, recommended
+HashAlgorithm.SHA512   # More secure
+HashAlgorithm.MD5      # Fast but not cryptographically secure
+HashAlgorithm.BLAKE3   # Very fast, modern
+HashAlgorithm.XXH3     # Extremely fast, good for large files
+```
+
+### Example: Image Processing Pipeline
+
+```python
+from raise_ import (
+    FeatureStore, BlobRef, BlobRegistry, MultimodalSource,
+    ContentType, IntegrityPolicy, BlobIntegrityCheck,
+)
+
+# 1. Create feature group with blob reference column
+fs = FeatureStore("acme/mlplatform/vision")
+fg = fs.create_feature_group("product-images")
+fg.create_features_from_schema({
+    "product_id": "string",
+    "image_ref": BlobRef(content_types=["image/png", "image/jpeg"]),
+    "embedding": "float32[512]",
+})
+
+# 2. Create registry with integrity policy
+registry = BlobRegistry(
+    name="product-images",
+    policy=IntegrityPolicy.on_write(),
+)
+
+# 3. Scan for images (returns references, not data)
+source = MultimodalSource(
+    name="product_images",
+    uri_prefix="s3://products/images/",
+    content_types=[ContentType.IMAGE_JPEG, ContentType.IMAGE_PNG],
+    registry=registry,
+)
+refs = source.scan()
+
+# 4. Process with integrity check
+check = BlobIntegrityCheck(
+    name="verify_images",
+    column="image_ref",
+    verify_checksum=True,
+)
+
+# Key benefit: Only references move through the pipeline,
+# not the actual image bytes (which may be gigabytes)
+```
+
+---
+
 ## API Reference
 
 ### FeatureStore
@@ -1433,6 +1773,8 @@ See the `examples/` directory for complete working examples:
 4. **04_cross_org_access.py** - Cross-organization sharing and ACLs
 5. **05_audit_logging.py** - Audit queries, alerts, and exports
 6. **06_analytics.py** - Aggregations, distributions, live tables, dashboards, and alerts
+7. **07_transformations.py** - ETL jobs, SQL/Python transforms, scheduling, Airflow integration
+8. **08_multimodal.py** - Blob references, registries, integrity validation, multimodal sources
 
 ---
 
