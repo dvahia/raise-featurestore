@@ -86,6 +86,15 @@ from raise_.transforms import (
     IntegrityPolicy,
     MultimodalSource,
     create_reference,
+    # Inference
+    ModelSpec,
+    AcceleratorConfig,
+    InferenceTransform,
+    GPUType,
+    ModelFramework,
+    embedding_inference,
+    image_inference,
+    llm_inference,
 )
 from raise_.exceptions import (
     RaiseError,
@@ -181,6 +190,15 @@ __all__ = [
     "IntegrityPolicy",
     "MultimodalSource",
     "create_reference",
+    # Inference
+    "ModelSpec",
+    "AcceleratorConfig",
+    "InferenceTransform",
+    "GPUType",
+    "ModelFramework",
+    "embedding_inference",
+    "image_inference",
+    "llm_inference",
     # Exceptions
     "RaiseError",
     "FeatureExistsError",

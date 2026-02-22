@@ -1,9 +1,10 @@
 # Raise Feature Store - Product Requirements Document
 
-**Version:** 1.2
+**Version:** 1.3
 **Status:** Ready for Engineering Review
 **Last Updated:** 2026-02-21
 
+> **v1.3 Changes:** Added Bulk Inference Support (Section 18)
 > **v1.2 Changes:** Added Multimodal Data Support (Section 17)
 > **v1.1 Changes:** Added ETL/Transformations (Section 15) and Airflow Integration (Section 16)
 
@@ -36,11 +37,12 @@ This PRD defines the backend systems and middleware required to support the Rais
 15. [ETL and Transformations](#15-etl-and-transformations)
 16. [Airflow Integration](#16-airflow-integration)
 17. [Multimodal Data Support](#17-multimodal-data-support)
-18. [Storage Requirements](#18-storage-requirements)
-19. [API Layer](#19-api-layer)
-20. [Non-Functional Requirements](#20-non-functional-requirements)
-21. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
-22. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
+18. [Bulk Inference Support](#18-bulk-inference-support)
+19. [Storage Requirements](#19-storage-requirements)
+20. [API Layer](#20-api-layer)
+21. [Non-Functional Requirements](#21-non-functional-requirements)
+22. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
+23. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
 
 ---
 
@@ -2053,9 +2055,402 @@ Similar patterns for Google Cloud Storage and Azure Blob Storage using respectiv
 
 ---
 
-## 18. Storage Requirements
+## 18. Bulk Inference Support
 
-### 18.1 Metadata Store
+### 18.1 Overview
+
+Bulk inference transformations enable batch AI model execution on feature data, distinct from traditional ETL operations. These jobs require specialized compute resources (GPUs, TPUs) and model-aware configuration.
+
+**Key Design Principles:**
+- Model-centric: Transform definitions include model specifications
+- Accelerator-aware: First-class support for GPU/TPU resource allocation
+- Batch-optimized: Configurable batching strategies for throughput
+- Framework-agnostic: Support for PyTorch, TensorFlow, ONNX, and more
+- Integration: Seamless integration with existing Job infrastructure
+
+### 18.2 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Bulk Inference Pipeline                        │
+│                                                                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │   Source    │  │  Inference  │  │   Target    │             │
+│  │  Features   │  │  Transform  │  │  Features   │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+│         │                │                │                      │
+│         │         ┌──────┴──────┐        │                      │
+│         │         │             │        │                      │
+│         │    ┌────┴────┐  ┌────┴────┐   │                      │
+│         │    │  Model  │  │Accelerator│  │                      │
+│         │    │  Spec   │  │  Config  │   │                      │
+│         │    └─────────┘  └──────────┘   │                      │
+│         │                                 │                      │
+│  ┌──────┴─────────────────────────────────┴──────┐              │
+│  │              Inference Runtime                 │              │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐       │              │
+│  │  │  Batch  │  │  Model  │  │  Output │       │              │
+│  │  │ Loading │  │ Executor│  │ Mapping │       │              │
+│  │  └─────────┘  └─────────┘  └─────────┘       │              │
+│  └───────────────────────────────────────────────┘              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 18.3 Model Specification
+
+#### ModelSpec Structure
+
+```python
+@dataclass
+class ModelSpec:
+    uri: str                              # Model location (HuggingFace, S3, MLflow)
+    framework: ModelFramework             # pytorch, tensorflow, onnx, etc.
+    version: str = "latest"               # Model version
+    precision: ModelPrecision = FP32      # fp32, fp16, bf16, int8, int4
+    input_schema: dict[str, str]          # Input tensor shapes/types
+    output_schema: dict[str, str]         # Output tensor shapes/types
+    config: dict[str, Any]                # Model-specific configuration
+```
+
+#### Model Frameworks
+
+| Framework | URI Prefix | Description |
+|-----------|------------|-------------|
+| `PYTORCH` | `s3://`, `file://` | Native PyTorch models (.pt, .pth) |
+| `TENSORFLOW` | `s3://`, `gs://` | SavedModel or frozen graphs |
+| `ONNX` | `s3://`, `file://` | ONNX Runtime optimized |
+| `HUGGINGFACE` | `hf://` | HuggingFace Hub models |
+| `MLFLOW` | `mlflow://` | MLflow Model Registry |
+| `TRITON` | `triton://` | NVIDIA Triton Inference Server |
+| `SKLEARN` | `s3://` | Scikit-learn models (joblib) |
+| `XGBOOST` | `s3://` | XGBoost models |
+| `LIGHTGBM` | `s3://` | LightGBM models |
+| `JAX` | `s3://` | JAX/Flax models |
+| `CUSTOM` | Any | Custom model loaders |
+
+#### Model Precision
+
+| Precision | Bits | Memory | Use Case |
+|-----------|------|--------|----------|
+| `FP32` | 32 | Baseline | Default, highest accuracy |
+| `FP16` | 16 | 50% | Standard inference optimization |
+| `BF16` | 16 | 50% | Training/inference on A100+ |
+| `INT8` | 8 | 25% | Quantized inference |
+| `INT4` | 4 | 12.5% | Aggressive quantization (LLMs) |
+
+### 18.4 Accelerator Configuration
+
+#### AcceleratorConfig Structure
+
+```python
+@dataclass
+class AcceleratorConfig:
+    accelerator_type: AcceleratorType      # CPU, GPU, TPU
+    gpu_type: GPUType | None               # Specific GPU model
+    tpu_type: TPUType | None               # Specific TPU version
+    count: int = 1                         # Number of accelerators
+    memory_gb: int | None = None           # Memory requirement
+    multi_gpu_strategy: str | None = None  # data_parallel, tensor_parallel
+```
+
+#### GPU Types
+
+| GPU Type | Memory | Compute Capability | Use Case |
+|----------|--------|-------------------|----------|
+| `NVIDIA_T4` | 16 GB | 7.5 | Entry-level inference |
+| `NVIDIA_A10G` | 24 GB | 8.6 | Balanced cost/performance |
+| `NVIDIA_A100` | 40 GB | 8.0 | High-performance training/inference |
+| `NVIDIA_A100_80GB` | 80 GB | 8.0 | Large models (LLMs) |
+| `NVIDIA_H100` | 80 GB | 9.0 | Latest generation, highest throughput |
+| `NVIDIA_L4` | 24 GB | 8.9 | Efficient inference |
+
+#### TPU Types
+
+| TPU Type | Cores | Memory | Use Case |
+|----------|-------|--------|----------|
+| `TPU_V2` | 8 | 64 GB | Standard workloads |
+| `TPU_V3` | 8 | 128 GB | Larger models |
+| `TPU_V4` | 8 | 128 GB | Latest generation |
+| `TPU_V5` | 8 | 256 GB | Extreme scale |
+
+#### Multi-GPU Strategies
+
+| Strategy | Description | Use Case |
+|----------|-------------|----------|
+| `data_parallel` | Replicate model, split data | Batch throughput |
+| `tensor_parallel` | Split model across GPUs | Large models |
+| `pipeline_parallel` | Stage model across GPUs | Very deep models |
+
+### 18.5 Batch Configuration
+
+```python
+@dataclass
+class BatchConfig:
+    batch_size: int = 32                   # Samples per batch
+    max_batch_size: int | None = None      # For dynamic batching
+    dynamic_batching: bool = False         # Enable adaptive batching
+    prefetch_batches: int = 2              # Batches to prefetch
+    num_workers: int = 4                   # Data loading workers
+    timeout_seconds: float = 300.0         # Per-batch timeout
+    retry_failed: bool = True              # Retry failed batches
+    max_retries: int = 3                   # Maximum retry attempts
+```
+
+### 18.6 Inference Runtime
+
+```python
+@dataclass
+class InferenceRuntime:
+    image: str                             # Container image
+    python_version: str = "3.10"           # Python version
+    packages: list[str]                    # Additional pip packages
+    env_vars: dict[str, str]               # Environment variables
+    resources: dict[str, Any]              # Resource requests/limits
+    startup_timeout_seconds: int = 300     # Container startup timeout
+    warmup_batches: int = 1                # Warmup batches before inference
+```
+
+### 18.7 Inference Transform
+
+#### InferenceTransform Structure
+
+```python
+@dataclass
+class InferenceTransform:
+    name: str                              # Transform name
+    description: str                       # Human-readable description
+    model: ModelSpec                       # Model specification
+    accelerator: AcceleratorConfig         # Compute resources
+    batch_config: BatchConfig              # Batching settings
+    runtime: InferenceRuntime | None       # Container runtime
+    input_mapping: dict[str, str]          # Source column -> model input
+    output_mapping: dict[str, str]         # Model output -> target column
+    mode: InferenceMode                    # batch, streaming, online
+```
+
+#### Inference Modes
+
+| Mode | Latency | Throughput | Use Case |
+|------|---------|------------|----------|
+| `BATCH` | High | High | Bulk processing jobs |
+| `STREAMING` | Medium | Medium | Continuous processing |
+| `ONLINE` | Low | Low | Real-time serving |
+
+### 18.8 Database Schema
+
+```sql
+CREATE TABLE inference_transforms (
+    id UUID PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs(id),
+    name VARCHAR(128) NOT NULL,
+    description TEXT,
+    model_spec JSONB NOT NULL,
+    accelerator_config JSONB NOT NULL,
+    batch_config JSONB NOT NULL DEFAULT '{}',
+    runtime_config JSONB,
+    input_mapping JSONB NOT NULL DEFAULT '{}',
+    output_mapping JSONB NOT NULL DEFAULT '{}',
+    mode VARCHAR(32) DEFAULT 'batch',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE inference_runs (
+    id UUID PRIMARY KEY,
+    job_run_id UUID NOT NULL REFERENCES job_runs(id),
+    transform_id UUID NOT NULL REFERENCES inference_transforms(id),
+    status VARCHAR(32) NOT NULL,
+    total_samples BIGINT DEFAULT 0,
+    processed_samples BIGINT DEFAULT 0,
+    failed_samples BIGINT DEFAULT 0,
+    throughput_samples_per_sec FLOAT,
+    avg_latency_ms FLOAT,
+    p99_latency_ms FLOAT,
+    gpu_utilization_pct FLOAT,
+    peak_memory_gb FLOAT,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    error TEXT
+);
+
+CREATE INDEX idx_inference_runs_job ON inference_runs(job_run_id);
+CREATE INDEX idx_inference_runs_status ON inference_runs(status);
+```
+
+### 18.9 Convenience Constructors
+
+#### Embedding Inference
+
+```python
+embedding_inference(
+    model_uri="hf://sentence-transformers/all-MiniLM-L6-v2",
+    input_column="text",
+    output_column="embedding",
+    batch_size=128,
+    gpu_type=GPUType.NVIDIA_T4,
+)
+```
+
+#### Image Inference
+
+```python
+image_inference(
+    model_uri="hf://openai/clip-vit-base-patch32",
+    image_column="image_ref",
+    output_column="image_embedding",
+    batch_size=64,
+    gpu_type=GPUType.NVIDIA_A10G,
+)
+```
+
+#### Classification Inference
+
+```python
+classification_inference(
+    model_uri="mlflow://models:/sentiment-classifier/Production",
+    input_column="text",
+    output_column="sentiment",
+    scores_column="confidence",
+    gpu_type=GPUType.NVIDIA_T4,
+)
+```
+
+#### LLM Inference
+
+```python
+llm_inference(
+    model_uri="hf://meta-llama/Llama-2-70b-chat-hf",
+    prompt_column="prompt",
+    output_column="completion",
+    max_tokens=512,
+    temperature=0.7,
+    gpu_type=GPUType.NVIDIA_A100_80GB,
+    gpu_count=4,
+    multi_gpu_strategy="tensor_parallel",
+    precision=ModelPrecision.INT8,
+)
+```
+
+### 18.10 Integration with Jobs
+
+Inference transforms integrate with the existing Job infrastructure:
+
+```python
+job = Job(
+    name="generate_embeddings",
+    sources=[FeatureGroupSource(group=user_signals)],
+    transform=embedding_inference(
+        model_uri="hf://sentence-transformers/all-MiniLM-L6-v2",
+        input_column="user_bio",
+        output_column="bio_embedding",
+        batch_size=256,
+        gpu_type=GPUType.NVIDIA_T4,
+    ),
+    target=Target(
+        feature_group=user_embeddings,
+        features={"bio_embedding": "embedding"},
+        write_mode="upsert",
+        key_columns=["user_id"],
+    ),
+    schedule=CronSchedule("0 2 * * *"),
+)
+```
+
+### 18.11 Chained Inference
+
+Multiple inference transforms can be chained:
+
+```python
+job1 = Job(
+    name="embed_images",
+    transform=image_inference(...),
+    ...
+)
+
+job2 = Job(
+    name="classify_images",
+    sources=[FeatureGroupSource(group=job1.target.feature_group)],
+    transform=classification_inference(...),
+    ...
+)
+```
+
+### 18.12 API Endpoints
+
+```
+# Inference Transform Management
+POST   /v1/jobs/{name}/inference-transform
+GET    /v1/jobs/{name}/inference-transform
+PATCH  /v1/jobs/{name}/inference-transform
+
+# Inference Runs
+GET    /v1/jobs/{name}/runs/{run_id}/inference
+GET    /v1/jobs/{name}/runs/{run_id}/inference/metrics
+
+# Model Registry Integration
+GET    /v1/models
+GET    /v1/models/{uri}
+POST   /v1/models/{uri}/validate
+```
+
+### 18.13 Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `inference_samples_total` | Counter | Total samples processed |
+| `inference_samples_failed` | Counter | Failed samples |
+| `inference_batch_duration_seconds` | Histogram | Per-batch latency |
+| `inference_throughput_samples_per_sec` | Gauge | Current throughput |
+| `inference_gpu_utilization_percent` | Gauge | GPU utilization |
+| `inference_gpu_memory_used_gb` | Gauge | GPU memory usage |
+| `inference_queue_depth` | Gauge | Pending batches |
+| `inference_model_load_seconds` | Histogram | Model loading time |
+| `inference_warmup_seconds` | Histogram | Warmup duration |
+
+### 18.14 Orchestration
+
+#### Airflow Integration
+
+Inference jobs generate Airflow DAGs with GPU resource requirements:
+
+```python
+with DAG(dag_id="raise_generate_embeddings", ...) as dag:
+    inference_task = KubernetesPodOperator(
+        task_id='inference',
+        image=runtime.image,
+        resources={
+            'limits': {'nvidia.com/gpu': accelerator.count}
+        },
+        node_selector={'accelerator': 'nvidia-tesla-t4'},
+        ...
+    )
+```
+
+#### Kubernetes Integration
+
+```yaml
+# Pod template for inference jobs
+spec:
+  containers:
+  - name: inference
+    image: {{ runtime.image }}
+    resources:
+      limits:
+        nvidia.com/gpu: {{ accelerator.count }}
+        memory: {{ accelerator.memory_gb }}Gi
+  nodeSelector:
+    cloud.google.com/gke-accelerator: nvidia-tesla-{{ gpu_type }}
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+```
+
+---
+
+## 19. Storage Requirements
+
+### 19.1 Metadata Store
 
 **Technology:** PostgreSQL 14+
 
@@ -2071,7 +2466,7 @@ Similar patterns for Google Cloud Storage and Azure Blob Storage using respectiv
 - ~500B per audit entry
 - Estimate: 100K features = 100MB metadata + 10GB audit/year
 
-### 18.2 Feature Data Store
+### 19.2 Feature Data Store
 
 **Technology:** Columnar storage (Parquet on S3/GCS, Delta Lake, or Apache Iceberg)
 
@@ -2087,7 +2482,7 @@ Similar patterns for Google Cloud Storage and Azure Blob Storage using respectiv
 - Embeddings: 4 bytes * dimensions * rows
 - Estimate: 1M users * 512-dim embedding = 2GB per feature
 
-### 18.3 Analytics Cache
+### 19.3 Analytics Cache
 
 **Technology:** Redis Cluster
 
@@ -2101,7 +2496,7 @@ Similar patterns for Google Cloud Storage and Azure Blob Storage using respectiv
 - ~10KB per cached result
 - Estimate: 10K active analyses * 10KB = 100MB
 
-### 18.4 Lineage Graph Store
+### 19.4 Lineage Graph Store
 
 **Options:**
 
@@ -2113,7 +2508,7 @@ Similar patterns for Google Cloud Storage and Azure Blob Storage using respectiv
 
 **Recommendation:** Start with PostgreSQL + recursive CTEs, migrate to Neo4j if lineage graphs become very deep (>100 levels).
 
-### 18.5 Blob Storage
+### 19.5 Blob Storage
 
 **Technology:** S3 / GCS / Azure Blob
 
@@ -2123,7 +2518,7 @@ Similar patterns for Google Cloud Storage and Azure Blob Storage using respectiv
 - Dashboard snapshots
 - Large analysis results
 
-### 18.6 Message Queue
+### 19.6 Message Queue
 
 **Technology:** Kafka / SQS / Pub/Sub
 
@@ -2135,9 +2530,9 @@ Similar patterns for Google Cloud Storage and Azure Blob Storage using respectiv
 
 ---
 
-## 19. API Layer
+## 20. API Layer
 
-### 19.1 REST API Endpoints
+### 20.1 REST API Endpoints
 
 #### Organizations
 ```
@@ -2280,13 +2675,13 @@ GET    /v1/jobs/{name}/lineage
 GET    /v1/jobs/{name}/dag
 ```
 
-### 19.2 Authentication
+### 20.2 Authentication
 
 - OAuth2 / OIDC for user authentication
 - API keys for service-to-service
 - JWT tokens with org/user claims
 
-### 19.3 Rate Limiting
+### 20.3 Rate Limiting
 
 | Tier | Requests/min | Concurrent Jobs |
 |------|--------------|-----------------|
@@ -2294,7 +2689,7 @@ GET    /v1/jobs/{name}/dag
 | Standard | 1000 | 10 |
 | Enterprise | 10000 | 100 |
 
-### 19.4 Error Responses
+### 20.4 Error Responses
 
 ```json
 {
@@ -2311,9 +2706,9 @@ GET    /v1/jobs/{name}/dag
 
 ---
 
-## 20. Non-Functional Requirements
+## 21. Non-Functional Requirements
 
-### 20.1 Performance
+### 21.1 Performance
 
 | Operation | Target Latency (p99) |
 |-----------|---------------------|
@@ -2326,14 +2721,14 @@ GET    /v1/jobs/{name}/dag
 | Live table query | < 200ms |
 | Dashboard render | < 2s |
 
-### 20.2 Availability
+### 21.2 Availability
 
 - **Target SLA:** 99.9% (8.76 hours downtime/year)
 - **Metadata store:** Multi-AZ deployment
 - **Analytics:** Graceful degradation (serve cached results)
 - **CDC:** At-least-once delivery
 
-### 20.3 Scalability
+### 21.3 Scalability
 
 | Dimension | Initial | Scale Target |
 |-----------|---------|--------------|
@@ -2343,7 +2738,7 @@ GET    /v1/jobs/{name}/dag
 | Analytics jobs/day | 1,000 | 1,000,000 |
 | Audit events/day | 100,000 | 100,000,000 |
 
-### 20.4 Security
+### 21.4 Security
 
 - **Encryption at rest:** AES-256 for all data stores
 - **Encryption in transit:** TLS 1.3 for all connections
@@ -2351,14 +2746,14 @@ GET    /v1/jobs/{name}/dag
 - **Audit:** All access logged, immutable audit trail
 - **Network:** VPC isolation, private endpoints
 
-### 20.5 Compliance
+### 21.5 Compliance
 
 - **Data residency:** Support region-specific deployment
 - **Data retention:** Configurable per organization
 - **Right to deletion:** Support GDPR/CCPA data removal
 - **Audit export:** SOC2/ISO27001 compliant exports
 
-### 20.6 Disaster Recovery
+### 21.6 Disaster Recovery
 
 - **RPO:** 1 hour (point-in-time recovery)
 - **RTO:** 4 hours (full service restoration)
@@ -2519,6 +2914,7 @@ RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
 | 1.0 | 2026-02-21 | API Design Team | Initial PRD |
 | 1.1 | 2026-02-21 | API Design Team | Added ETL/Transformations (Section 15) and Airflow Integration (Section 16) |
 | 1.2 | 2026-02-21 | API Design Team | Added Multimodal Data Support (Section 17) |
+| 1.3 | 2026-02-21 | API Design Team | Added Bulk Inference Support (Section 18) |
 
 ---
 

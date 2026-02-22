@@ -112,6 +112,30 @@ from raise_.transforms.multimodal import (
     infer_content_type,
 )
 
+from raise_.transforms.inference import (
+    # Enums
+    ModelFramework,
+    AcceleratorType,
+    GPUType,
+    TPUType,
+    InferenceMode,
+    ModelPrecision,
+    # Core classes
+    ModelSpec,
+    AcceleratorConfig,
+    BatchConfig,
+    InferenceRuntime,
+    InferenceTransform,
+    InferenceResult,
+    # Decorator
+    inference_transform,
+    # Convenience constructors
+    embedding_inference,
+    classification_inference,
+    image_inference,
+    llm_inference,
+)
+
 
 __all__ = [
     # Sources
@@ -199,4 +223,22 @@ __all__ = [
     "BlobReferenceType",
     "create_reference",
     "infer_content_type",
+    # Inference
+    "ModelFramework",
+    "AcceleratorType",
+    "GPUType",
+    "TPUType",
+    "InferenceMode",
+    "ModelPrecision",
+    "ModelSpec",
+    "AcceleratorConfig",
+    "BatchConfig",
+    "InferenceRuntime",
+    "InferenceTransform",
+    "InferenceResult",
+    "inference_transform",
+    "embedding_inference",
+    "classification_inference",
+    "image_inference",
+    "llm_inference",
 ]

@@ -68,6 +68,12 @@ user_signals.create_feature(
   - [Multimodal Sources](#multimodal-sources)
   - [Integrity Validation](#integrity-validation)
   - [Blob Integrity Checks](#blob-integrity-checks)
+- [Bulk Inference](#bulk-inference)
+  - [Model Specification](#model-specification)
+  - [Accelerator Configuration](#accelerator-configuration)
+  - [Inference Transforms](#inference-transforms)
+  - [Convenience Functions](#convenience-functions)
+  - [Chained Inference](#chained-inference)
 - [API Reference](#api-reference)
 
 ---
@@ -1650,6 +1656,378 @@ check = BlobIntegrityCheck(
 
 ---
 
+## Bulk Inference
+
+Raise supports bulk inference transformations that run AI models on feature data, distinct from traditional ETL. These jobs require specialized accelerators (GPU/TPU) and model-aware configuration.
+
+### Model Specification
+
+Define model location, framework, and configuration.
+
+```python
+from raise_ import ModelSpec, ModelFramework, ModelPrecision
+
+# HuggingFace model
+model = ModelSpec(
+    uri="hf://sentence-transformers/all-MiniLM-L6-v2",
+    framework=ModelFramework.HUGGINGFACE,
+    version="latest",
+    input_schema={"text": "string"},
+    output_schema={"embedding": "float32[384]"},
+)
+
+# MLflow model from registry
+model = ModelSpec(
+    uri="mlflow://models:/sentiment-classifier/Production",
+    framework=ModelFramework.SKLEARN,
+)
+
+# PyTorch model from S3
+model = ModelSpec(
+    uri="s3://models/custom/text-encoder-v2.pt",
+    framework=ModelFramework.PYTORCH,
+    precision=ModelPrecision.FP16,
+)
+
+# ONNX optimized model
+model = ModelSpec(
+    uri="s3://models/optimized/embedding.onnx",
+    framework=ModelFramework.ONNX,
+)
+```
+
+#### Supported Frameworks
+
+| Framework | URI Prefix | Description |
+|-----------|------------|-------------|
+| `PYTORCH` | `s3://`, `file://` | Native PyTorch models |
+| `TENSORFLOW` | `s3://`, `gs://` | SavedModel or frozen graphs |
+| `ONNX` | `s3://`, `file://` | ONNX Runtime optimized |
+| `HUGGINGFACE` | `hf://` | HuggingFace Hub models |
+| `MLFLOW` | `mlflow://` | MLflow Model Registry |
+| `TRITON` | `triton://` | NVIDIA Triton Inference Server |
+| `SKLEARN` | `s3://` | Scikit-learn models |
+| `XGBOOST` | `s3://` | XGBoost models |
+| `JAX` | `s3://` | JAX/Flax models |
+
+#### Model Precision
+
+| Precision | Description | Use Case |
+|-----------|-------------|----------|
+| `FP32` | Full precision | Default, highest accuracy |
+| `FP16` | Half precision | Standard optimization |
+| `BF16` | Brain floating point | Training on A100+ |
+| `INT8` | 8-bit quantized | Efficient inference |
+| `INT4` | 4-bit quantized | Large LLMs |
+
+### Accelerator Configuration
+
+Configure GPU/TPU resources for inference.
+
+```python
+from raise_ import AcceleratorConfig, GPUType, TPUType
+
+# Single GPU
+gpu_config = AcceleratorConfig.gpu(GPUType.NVIDIA_T4)
+
+# Multi-GPU with data parallelism
+multi_gpu = AcceleratorConfig.multi_gpu(
+    gpu_type=GPUType.NVIDIA_A100,
+    count=4,
+    strategy="data_parallel",
+)
+
+# Large GPU for LLMs
+large_gpu = AcceleratorConfig.gpu(
+    GPUType.NVIDIA_A100_80GB,
+    memory_gb=80,
+)
+
+# TPU configuration
+tpu_config = AcceleratorConfig.tpu(TPUType.TPU_V4, count=8)
+
+# CPU only
+cpu_config = AcceleratorConfig.cpu(cores=8)
+```
+
+#### GPU Types
+
+| GPU Type | Memory | Use Case |
+|----------|--------|----------|
+| `NVIDIA_T4` | 16 GB | Entry-level inference |
+| `NVIDIA_A10G` | 24 GB | Balanced cost/performance |
+| `NVIDIA_A100` | 40 GB | High-performance |
+| `NVIDIA_A100_80GB` | 80 GB | Large models (LLMs) |
+| `NVIDIA_H100` | 80 GB | Latest generation |
+| `NVIDIA_L4` | 24 GB | Efficient inference |
+
+#### Multi-GPU Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| `data_parallel` | Replicate model, split data batches |
+| `tensor_parallel` | Split model across GPUs |
+| `pipeline_parallel` | Stage model across GPUs |
+
+### Inference Transforms
+
+Create inference transforms that integrate with the Job infrastructure.
+
+```python
+from raise_ import (
+    InferenceTransform, ModelSpec, AcceleratorConfig,
+    BatchConfig, InferenceRuntime, GPUType,
+)
+
+# Define inference transform
+transform = InferenceTransform(
+    name="embed_text",
+    model=ModelSpec(
+        uri="hf://sentence-transformers/all-MiniLM-L6-v2",
+        framework=ModelFramework.HUGGINGFACE,
+    ),
+    accelerator=AcceleratorConfig.gpu(GPUType.NVIDIA_T4),
+    batch_config=BatchConfig(batch_size=128),
+    input_mapping={"text": "user_bio"},
+    output_mapping={"embedding": "bio_embedding"},
+)
+
+# Create job with inference transform
+job = fs.create_job(
+    name="generate_embeddings",
+    sources=[FeatureGroupSource(group="user-signals")],
+    transform=transform,
+    target=Target(
+        feature_group="user-embeddings",
+        features={"bio_embedding": "embedding"},
+        write_mode="upsert",
+        key_columns=["user_id"],
+    ),
+    schedule=Schedule.daily(hour=2),
+)
+```
+
+#### Batch Configuration
+
+```python
+from raise_ import BatchConfig
+
+# Standard batch config
+batch = BatchConfig(
+    batch_size=64,
+    prefetch_batches=2,
+    num_workers=4,
+)
+
+# Dynamic batching for variable-length inputs
+dynamic = BatchConfig(
+    batch_size=32,
+    max_batch_size=256,
+    dynamic_batching=True,
+)
+
+# Small batches for LLM inference
+llm_batch = BatchConfig(
+    batch_size=8,
+    timeout_seconds=300.0,
+    retry_failed=True,
+    max_retries=3,
+)
+```
+
+#### Inference Runtime
+
+```python
+from raise_ import InferenceRuntime
+
+runtime = InferenceRuntime(
+    image="pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime",
+    python_version="3.10",
+    packages=["transformers>=4.35", "accelerate", "sentence-transformers"],
+    env_vars={"HF_HOME": "/cache/huggingface"},
+    warmup_batches=2,
+)
+```
+
+### Convenience Functions
+
+Use convenience functions for common inference patterns.
+
+#### Embedding Inference
+
+```python
+from raise_ import embedding_inference, GPUType
+
+transform = embedding_inference(
+    model_uri="hf://sentence-transformers/all-MiniLM-L6-v2",
+    input_column="text",
+    output_column="embedding",
+    batch_size=128,
+    gpu_type=GPUType.NVIDIA_T4,
+)
+```
+
+#### Image Inference
+
+```python
+from raise_ import image_inference, GPUType
+
+transform = image_inference(
+    model_uri="hf://openai/clip-vit-base-patch32",
+    image_column="image_ref",
+    output_column="image_embedding",
+    batch_size=64,
+    gpu_type=GPUType.NVIDIA_A10G,
+)
+```
+
+#### LLM Inference
+
+```python
+from raise_ import llm_inference, GPUType, ModelPrecision
+
+transform = llm_inference(
+    model_uri="hf://meta-llama/Llama-2-70b-chat-hf",
+    prompt_column="prompt",
+    output_column="completion",
+    max_tokens=512,
+    temperature=0.7,
+    gpu_type=GPUType.NVIDIA_A100_80GB,
+    gpu_count=4,
+    multi_gpu_strategy="tensor_parallel",
+    precision=ModelPrecision.INT8,
+)
+```
+
+#### Custom Inference with Decorator
+
+```python
+from raise_.transforms import inference_transform, GPUType
+
+@inference_transform(
+    name="custom_scorer",
+    gpu_type=GPUType.NVIDIA_T4,
+)
+def custom_scorer(context, batch):
+    # Custom inference logic
+    scores = model.predict(batch["features"])
+    return {"score": scores}
+```
+
+### Chained Inference
+
+Chain multiple inference jobs for complex pipelines.
+
+```python
+# Step 1: Generate embeddings
+job1 = fs.create_job(
+    name="step1_embed",
+    sources=[FeatureGroupSource(group="user-signals")],
+    transform=embedding_inference(
+        model_uri="hf://sentence-transformers/all-MiniLM-L6-v2",
+        input_column="text",
+        output_column="embedding",
+    ),
+    target=Target(feature_group="embeddings"),
+)
+
+# Step 2: Classify based on embeddings
+job2 = fs.create_job(
+    name="step2_classify",
+    sources=[FeatureGroupSource(group="embeddings")],
+    transform=classification_inference(
+        model_uri="mlflow://models:/classifier/Production",
+        input_column="embedding",
+        output_column="category",
+    ),
+    target=Target(feature_group="classifications"),
+)
+```
+
+### Inference Result
+
+Track inference execution metrics.
+
+```python
+# Get inference run details
+run = job.runs[-1]
+result = run.inference_result
+
+print(f"Total samples: {result.total_samples:,}")
+print(f"Success rate: {result.success_rate:.2%}")
+print(f"Throughput: {result.throughput_samples_per_sec:.1f} samples/sec")
+print(f"Duration: {result.duration_seconds:.1f}s")
+print(f"GPU utilization: {result.gpu_utilization_pct:.0f}%")
+print(f"Peak memory: {result.peak_memory_gb:.1f} GB")
+```
+
+### Example: Full Inference Pipeline
+
+```python
+from raise_ import (
+    FeatureStore, FeatureGroupSource, Target, Schedule,
+    embedding_inference, image_inference, GPUType,
+    IncrementalConfig, BlobIntegrityCheck,
+)
+
+fs = FeatureStore("acme/mlplatform/vision")
+
+# Create feature groups
+user_profiles = fs.create_feature_group("user-profiles")
+user_embeddings = fs.create_feature_group("user-embeddings")
+
+# Job 1: Generate text embeddings
+text_job = fs.create_job(
+    name="embed_user_bios",
+    sources=[FeatureGroupSource(group=user_profiles)],
+    transform=embedding_inference(
+        model_uri="hf://sentence-transformers/all-MiniLM-L6-v2",
+        input_column="bio",
+        output_column="bio_embedding",
+        batch_size=256,
+        gpu_type=GPUType.NVIDIA_T4,
+    ),
+    target=Target(
+        feature_group=user_embeddings,
+        features={"bio_embedding": "bio_embedding"},
+        write_mode="upsert",
+        key_columns=["user_id"],
+    ),
+    schedule=Schedule.daily(hour=2),
+    incremental=IncrementalConfig.incremental("updated_at"),
+)
+
+# Job 2: Generate image embeddings
+image_job = fs.create_job(
+    name="embed_profile_images",
+    sources=[FeatureGroupSource(group=user_profiles)],
+    transform=image_inference(
+        model_uri="hf://openai/clip-vit-base-patch32",
+        image_column="avatar_ref",
+        output_column="avatar_embedding",
+        batch_size=64,
+        gpu_type=GPUType.NVIDIA_A10G,
+    ),
+    target=Target(
+        feature_group=user_embeddings,
+        features={"avatar_embedding": "avatar_embedding"},
+    ),
+    quality_checks=[
+        BlobIntegrityCheck(
+            name="verify_avatars",
+            column="avatar_ref",
+            verify_existence=True,
+        ),
+    ],
+)
+
+# Deploy both jobs
+fs.deploy_job(text_job)
+fs.deploy_job(image_job)
+```
+
+---
+
 ## API Reference
 
 ### FeatureStore
@@ -1775,6 +2153,7 @@ See the `examples/` directory for complete working examples:
 6. **06_analytics.py** - Aggregations, distributions, live tables, dashboards, and alerts
 7. **07_transformations.py** - ETL jobs, SQL/Python transforms, scheduling, Airflow integration
 8. **08_multimodal.py** - Blob references, registries, integrity validation, multimodal sources
+9. **09_bulk_inference.py** - Inference transforms, GPU/TPU configuration, model specifications
 
 ---
 
