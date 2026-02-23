@@ -509,29 +509,81 @@ feature_group.ingest(data_frame=df, max_workers=3, wait=True)
 
 ## What Leading AI Labs Actually Use
 
-### Key Insight: Foundation Model Labs Don't Use Traditional Feature Stores
+### Key Insight: Foundation Model Labs DO Use Feature Engineering (Different Terminology)
 
-Traditional feature stores (Feast, Tecton, etc.) were designed for **applied ML** use cases: recommendation systems, fraud detection, pricing, ETAs. These systems transform tabular data into features for classical ML models.
+Foundation model labs absolutely use feature engineering for pre-training data - they just call it **"data quality signals"**, **"enrichment"**, or **"classifiers"** rather than "features". The process is fundamentally the same:
 
-**Foundation model labs (OpenAI, Anthropic, DeepMind, Meta AI) have fundamentally different needs:**
-- Their "features" are tokens and embeddings, not tabular columns
-- Training data is web-scale text/images, not structured business data
-- The bottleneck is distributed training, not feature serving
-- They need pre-training data pipelines, not feature engineering
+| Traditional ML Features | Foundation Model Signals |
+|------------------------|-------------------------|
+| `click_through_rate` | `educational_quality_score` |
+| `user_language` | `detected_language` |
+| `content_category` | `toxicity_classification` |
+| `fraud_score` | `perplexity_score` |
+| `engagement_metrics` | `url_metadata` (domain, protocol, path) |
+
+### Pre-Training Data Quality Signals (The "Features" of Foundation Models)
+
+Based on public datasets like [RedPajama-V2](https://www.emergentmind.com/topics/redpajama-dataset), [FineWeb](https://arxiv.org/html/2406.17557v1), and [Dolma](https://allenai.org/dolma), here are the signals (features) computed on web crawl data:
+
+#### RedPajama-V2: ~40 Quality Signals Per Document
+
+| Signal Category | Example Signals |
+|-----------------|-----------------|
+| **Language** | `detected_language`, `language_confidence` |
+| **Text Quality** | `perplexity_score`, `avg_word_length`, `unigram_entropy` |
+| **Lexical** | `fraction_unique_words`, `lexical_diversity`, `stopword_ratio` |
+| **Formatting** | `fraction_all_caps`, `lines_ending_ellipsis`, `bullet_point_ratio` |
+| **Content** | `url_domain`, `url_path_depth`, `has_date`, `word_count` |
+| **Deduplication** | `minhash_signature`, `simhash`, `exact_hash` |
+
+#### FineWeb-Edu: LLM-Based Quality Classification
+
+```
+Raw HTML → Trafilatura extraction → Quality classifier (Llama-3-70B scores 0-5)
+                                  → Embedding (Snowflake-arctic-embed)
+                                  → FastText classifier for efficiency
+```
+
+> "Applying the classifier to 15 trillion tokens of FineWeb required 6,000 H100 GPU hours."
+> — [FineWeb Paper](https://arxiv.org/html/2406.17557v1)
+
+#### Common Signal Pipeline
+
+```
+Web Crawl (WARC) → URL/Domain Features → Language Detection → Content Extraction
+                                                            ↓
+                 Dedup Hashes ← Perplexity Score ← Toxicity Classifier ← Quality Score
+                                                            ↓
+                                              Filtered Training Corpus
+```
+
+### The Gap: No Unified Feature Store for Pre-Training Data
+
+**What labs currently do:**
+- Custom pipelines per dataset (Dolma toolkit, FineWeb pipeline, etc.)
+- Ad-hoc signal computation scripts
+- Signals stored as Parquet columns or JSON metadata
+- No unified registry, versioning, or lineage
+
+**What a feature store for pre-training could provide:**
+- Declarative signal definitions (like Raise's `derived_from`)
+- Signal versioning and lineage tracking
+- Reusable signal libraries across datasets
+- Quality monitoring and drift detection
 
 ### OpenAI
 
 | Component | Technology |
 |-----------|------------|
 | **Distributed Training** | [Ray](https://www.ray.io/) for coordinating training across thousands of GPUs |
-| **Model Parallelism** | Custom internal libraries for weight/gradient/activation communication |
+| **Data Pipelines** | Custom internal - likely signal enrichment similar to public datasets |
+| **Internal Data Agent** | [Codex-powered metadata enrichment](https://openai.com/index/inside-our-in-house-data-agent/) for internal tables |
 | **Infrastructure** | Azure (Microsoft partnership), multi-datacenter training planned |
-| **Framework** | Not publicly disclosed (likely PyTorch-based) |
 
-> "We have a library for doing distributed training and it does model parallelism... we use Ray as a big part of that for doing all the communication."
-> — John Schulman, OpenAI Co-founder ([Ray Summit](https://thenewstack.io/openai-chats-about-scaling-llms-at-anyscales-ray-summit/))
+> "OpenAI runs a daily offline pipeline that aggregates table usage, human annotations, and Codex-derived enrichment into a single, normalized representation."
+> — [OpenAI Engineering](https://openai.com/index/inside-our-in-house-data-agent/)
 
-**No public feature store usage.** OpenAI's infrastructure is optimized for pre-training and RLHF, not feature serving.
+**Signal engineering is happening internally** - OpenAI uses RAG-based enrichment for internal data understanding. Pre-training data pipelines are not public, but likely involve extensive quality signal computation.
 
 ### Anthropic
 
@@ -539,10 +591,10 @@ Traditional feature stores (Feast, Tecton, etc.) were designed for **applied ML*
 |-----------|------------|
 | **Compute** | AWS Trainium, NVIDIA GPUs, Google TPUs (multi-cloud) |
 | **Scale** | 500K+ Trainium2 chips (AWS Project Rainier), 1M+ TPUs (Google) |
-| **Agent Tooling** | [Model Context Protocol (MCP)](https://www.anthropic.com/engineering) - open standard for tool integration |
-| **Infrastructure** | Building custom data centers ($50B investment with Fluidstack) |
+| **Data Pipelines** | Not public - likely similar signal pipelines for constitutional AI training |
+| **Agent Tooling** | [Model Context Protocol (MCP)](https://www.anthropic.com/engineering) |
 
-**No public feature store usage.** Anthropic focuses on constitutional AI training and safety research, with infrastructure oriented toward large-scale model training rather than feature management.
+**Pre-training signals unknown** but constitutional AI training likely involves safety-related signal computation (toxicity, harmful content classification).
 
 ### Google DeepMind
 
@@ -601,27 +653,54 @@ Microsoft's Azure ML Feature Store is notable for adding **declarative DSL synta
 
 The founding team of Michelangelo later created **Tecton**, one of the leading commercial feature stores.
 
+### Public Pre-Training Data Pipelines
+
+Several open datasets reveal the signal engineering patterns used at scale:
+
+| Dataset | Signals/Features | Scale | Key Insight |
+|---------|-----------------|-------|-------------|
+| [RedPajama-V2](https://www.emergentmind.com/topics/redpajama-dataset) | ~40 quality signals | 30T tokens | Full signal metadata preserved |
+| [FineWeb](https://arxiv.org/html/2406.17557v1) | Quality classifiers | 15T tokens | LLM-based scoring (6K H100 hours) |
+| [FineWeb-Edu](https://www.emergentmind.com/topics/fineweb-edu-dataset) | Educational score 0-5 | 1.3T tokens | Classifier-filtered subset |
+| [Dolma](https://allenai.org/dolma) | Built-in taggers | 3T tokens | Extensible signal toolkit |
+| [DCLM](https://arxiv.org/html/2505.05427v1) | FastText classifiers | 240T tokens | Efficiency-focused filtering |
+
 ### Summary: AI Lab Infrastructure Patterns
 
-| Lab | Primary Focus | Feature Store? | Key Infrastructure |
-|-----|---------------|----------------|-------------------|
-| **OpenAI** | Foundation models | No | Ray, custom distributed training |
-| **Anthropic** | Foundation models | No | Multi-cloud (AWS/GCP), MCP |
-| **DeepMind** | Research + Gemini | Vertex AI (cloud) | JAX, TPUs, TFX |
-| **Meta AI** | Research + Applied | Yes (Palette) | FBLearner, PyTorch, MWFS |
-| **Microsoft** | Cloud + Research | Yes (Azure ML) | Azure ML, declarative DSL |
+| Lab | Signal Engineering? | Feature Store? | Key Infrastructure |
+|-----|--------------------| ----------------|-------------------|
+| **OpenAI** | Yes (internal) | Custom pipelines | Ray, Codex enrichment |
+| **Anthropic** | Yes (likely) | Custom pipelines | Multi-cloud, MCP |
+| **DeepMind** | Yes (TFX) | Vertex AI (cloud) | JAX, TPUs |
+| **Meta AI** | Yes (Palette) | Yes (Palette) | FBLearner, PyTorch, MWFS |
+| **Microsoft** | Yes (Azure ML) | Yes (Azure ML) | Declarative DSL |
 
 ### Implications for Raise
 
-1. **Foundation model labs don't need traditional feature stores** - their workflows are fundamentally different (pre-training data pipelines vs. feature engineering)
+1. **Foundation model labs DO use feature engineering** - they call it "quality signals" or "data enrichment" but it's the same pattern (raw data → derived signals → filtering/weighting)
 
-2. **Applied ML teams do need feature stores** - Meta's Palette, Azure ML Feature Store, and Tecton serve real production needs
+2. **There's a gap in pre-training signal management** - Current tools (Dolma, FineWeb pipelines) are ad-hoc; no unified registry, versioning, or declarative definitions exist for pre-training signals
 
-3. **The industry is moving toward declarative APIs** - Azure ML's DSL preview validates Raise's design direction
+3. **Raise's patterns could extend to pre-training** - Declarative signal definitions, lineage tracking, and quality monitoring are needed but missing:
 
-4. **Notebook-first research workflows are underserved** - DeepMind uses JAX in notebooks, but feature management is ad-hoc
+   ```python
+   # Hypothetical: Raise for pre-training signals
+   signals = fs.create_feature_group("document-quality")
+   signals.create_feature("perplexity", dtype="float32",
+       derived_from="kenlm_score(text)")
+   signals.create_feature("toxicity", dtype="float32",
+       derived_from="classifier('toxicity', text)")
+   signals.create_feature("educational_score", dtype="int8",
+       derived_from="llm_score(text, 'educational quality 0-5')")
+   ```
 
-5. **Raise's target audience is researchers doing applied ML** - not foundation model training, but experiment-heavy research that eventually needs production features
+4. **The industry is moving toward declarative APIs** - Azure ML's DSL preview validates Raise's design direction
+
+5. **Both applied ML AND foundation models need this** - Feature stores aren't just for clicks/conversions; pre-training pipelines compute the same types of derived signals at massive scale
+
+6. **Opportunity: Unified signal management** - A feature store that handles both:
+   - Traditional features (CTR, embeddings, aggregations)
+   - Pre-training signals (perplexity, toxicity, language, quality scores)
 
 ---
 
