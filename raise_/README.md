@@ -34,8 +34,132 @@ user_signals.create_feature(
 )
 ```
 
+## API Design Philosophy
+
+Raise supports both **declarative** and **procedural** API patterns. Choose the style that fits your workflow:
+
+### Declarative Style
+
+Declare *what* you want. The system handles creation, validation, and idempotency.
+
+```python
+# Schema-based: declare all features at once
+group.create_features_from_schema({
+    "click_count": "int64",
+    "impression_count": "int64",
+    "ctr": "float64",
+})
+
+# YAML-based: declare features from a file
+group.create_features_from_file("features.yaml")
+
+# Derived features: declare the computation, not how to compute
+group.create_feature(
+    "ctr",
+    dtype="float64",
+    derived_from="click_count / NULLIF(impression_count, 0)",  # SQL expression
+)
+
+# Idempotent operations: safe to run multiple times
+group.create_feature("clicks", dtype="int64", if_exists="skip")
+
+# Analytics: declare what analysis you want
+group.analyze(Aggregation(feature="clicks", metrics=["sum", "avg", "p99"]))
+
+# Jobs: declare the pipeline, not the execution steps
+job = fs.create_job(
+    name="daily_clicks",
+    sources=[ObjectStorage(path="s3://events/")],
+    transform=SQLTransform(sql="SELECT user_id, COUNT(*) as clicks FROM source GROUP BY 1"),
+    target=Target(feature_group="user-signals"),
+    schedule=Schedule.daily(hour=2),
+)
+
+# Alerts: declare conditions, not monitoring logic
+fs.create_alert(
+    name="high-null-rate",
+    analysis=Aggregation(feature="embedding", metrics=["null_rate"]),
+    condition=Condition.GREATER_THAN(0.05),
+    notify=["team@example.com"],
+)
+```
+
+### Procedural Style
+
+Control each step explicitly. Useful for debugging, learning, or complex workflows.
+
+```python
+# Step-by-step hierarchy creation
+org = fs.create_organization("acme")
+domain = fs.create_domain("mlplatform")
+project = fs.create_project("recommendation")
+group = fs.create_feature_group("user-signals")
+
+# Explicit feature creation with full control
+feature = group.create_feature(
+    "click_count",
+    dtype="int64",
+    description="Total clicks per user",
+    tags=["engagement", "core"],
+    nullable=False,
+)
+
+# Job lifecycle management
+job = fs.create_job(name="compute_clicks", ...)
+job.activate()                    # Enable scheduling
+result = fs.deploy_job(job)       # Deploy to orchestrator
+run_id = fs.trigger_job(job)      # Manual trigger
+job.pause()                       # Pause scheduling
+job.resume()                      # Resume
+
+# Validation before creation
+result = group.validate_feature(
+    "ctr",
+    dtype="float64",
+    derived_from="click_count / impressions",
+)
+if result.valid:
+    group.create_feature("ctr", ...)
+else:
+    print(result.errors)
+```
+
+### When to Use Each Style
+
+| Use Declarative When | Use Procedural When |
+|---------------------|---------------------|
+| Automating with scripts or agents | Debugging issues step-by-step |
+| Defining infrastructure-as-code | Learning the API |
+| Reproducible, version-controlled configs | Handling partial failures |
+| Bulk operations | Fine-grained control over timing |
+| You care about *what*, not *how* | You need to inspect intermediate state |
+
+### Mixing Both Styles
+
+The styles are complementary. A common pattern:
+
+```python
+# Declarative: bulk setup
+group.create_features_from_schema({
+    "clicks": "int64",
+    "impressions": "int64",
+})
+
+# Procedural: selective updates
+ctr = group.create_feature("ctr", dtype="float64", derived_from="clicks / impressions")
+ctr.update(description="Click-through rate", tags=["derived", "ratio"])
+
+# Declarative: analytics
+result = group.analyze(Aggregation(feature="ctr", metrics=["avg", "p50", "p99"]))
+
+# Procedural: conditional logic
+if result.metrics["null_rate"] > 0.1:
+    ctr.deprecate(message="High null rate detected")
+```
+
 ## Table of Contents
 
+- [API Design Philosophy](#api-design-philosophy)
 - [Namespace Hierarchy](#namespace-hierarchy)
 - [Data Types](#data-types)
 - [Feature Creation](#feature-creation)
