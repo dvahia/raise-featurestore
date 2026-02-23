@@ -507,6 +507,124 @@ feature_group.ingest(data_frame=df, max_workers=3, wait=True)
 
 ---
 
+## What Leading AI Labs Actually Use
+
+### Key Insight: Foundation Model Labs Don't Use Traditional Feature Stores
+
+Traditional feature stores (Feast, Tecton, etc.) were designed for **applied ML** use cases: recommendation systems, fraud detection, pricing, ETAs. These systems transform tabular data into features for classical ML models.
+
+**Foundation model labs (OpenAI, Anthropic, DeepMind, Meta AI) have fundamentally different needs:**
+- Their "features" are tokens and embeddings, not tabular columns
+- Training data is web-scale text/images, not structured business data
+- The bottleneck is distributed training, not feature serving
+- They need pre-training data pipelines, not feature engineering
+
+### OpenAI
+
+| Component | Technology |
+|-----------|------------|
+| **Distributed Training** | [Ray](https://www.ray.io/) for coordinating training across thousands of GPUs |
+| **Model Parallelism** | Custom internal libraries for weight/gradient/activation communication |
+| **Infrastructure** | Azure (Microsoft partnership), multi-datacenter training planned |
+| **Framework** | Not publicly disclosed (likely PyTorch-based) |
+
+> "We have a library for doing distributed training and it does model parallelism... we use Ray as a big part of that for doing all the communication."
+> — John Schulman, OpenAI Co-founder ([Ray Summit](https://thenewstack.io/openai-chats-about-scaling-llms-at-anyscales-ray-summit/))
+
+**No public feature store usage.** OpenAI's infrastructure is optimized for pre-training and RLHF, not feature serving.
+
+### Anthropic
+
+| Component | Technology |
+|-----------|------------|
+| **Compute** | AWS Trainium, NVIDIA GPUs, Google TPUs (multi-cloud) |
+| **Scale** | 500K+ Trainium2 chips (AWS Project Rainier), 1M+ TPUs (Google) |
+| **Agent Tooling** | [Model Context Protocol (MCP)](https://www.anthropic.com/engineering) - open standard for tool integration |
+| **Infrastructure** | Building custom data centers ($50B investment with Fluidstack) |
+
+**No public feature store usage.** Anthropic focuses on constitutional AI training and safety research, with infrastructure oriented toward large-scale model training rather than feature management.
+
+### Google DeepMind
+
+| Component | Technology |
+|-----------|------------|
+| **Framework** | [JAX](https://github.com/google/jax) - functional, XLA-compiled, TPU-optimized |
+| **Production ML** | [TFX (TensorFlow Extended)](https://www.tensorflow.org/tfx) for pipeline orchestration |
+| **Cloud Platform** | [Vertex AI](https://cloud.google.com/vertex-ai) (includes Feature Store for enterprise users) |
+| **Hardware** | TPUs (custom Ironwood chips for inference) |
+| **Internal** | Unified ML infrastructure teams (consolidated in 2024) |
+
+**DeepMind researchers primarily use JAX** for its functional programming paradigm, automatic differentiation, and seamless TPU integration. TFX handles production pipelines but is separate from research workflows.
+
+> "JAX is known for speed and flexibility, particularly favored in research settings (DeepMind/Google AI) for its functional programming paradigm."
+
+### Meta AI (FAIR)
+
+| Component | Technology |
+|-----------|------------|
+| **ML Platform** | [FBLearner Flow](https://engineering.fb.com/2016/05/09/core-infra/introducing-fblearner-flow-facebook-s-ai-backbone/) (25%+ of engineering uses it) |
+| **Feature Store** | **Palette** - curated, crowd-sourced features |
+| **Orchestration** | [Meta Workflow Service (MWFS)](https://atscaleconference.com/evolution-of-ai-training-orchestration-with-serverless-ecosystem/) - event-driven, horizontally scalable |
+| **Data Stack** | HDFS, Spark, Samza, Cassandra |
+| **Framework** | PyTorch (Meta developed it) |
+| **Scale** | 350,000+ NVIDIA H100s (2024) |
+
+**Meta is the exception** - they do use an internal feature store (Palette) because they run massive applied ML systems (News Feed ranking, Ads, Recommendations). However, FAIR (research) likely operates differently from production ML teams.
+
+> "FBLearner Feature Store serves as the starting point for any ML modeling task... it serves as a marketplace that multiple teams can use to share features."
+
+### Microsoft AI
+
+| Component | Technology |
+|-----------|------------|
+| **Cloud Platform** | [Azure ML](https://azure.microsoft.com/en-us/products/machine-learning/) |
+| **Feature Store** | [Azure ML Managed Feature Store](https://learn.microsoft.com/en-us/azure/machine-learning/concept-what-is-managed-feature-store) |
+| **Recent Innovation** | DSL (Domain Specific Language) for declarative feature definitions (preview) |
+| **Framework** | PyTorch primarily, some TensorFlow |
+
+Microsoft's Azure ML Feature Store is notable for adding **declarative DSL syntax** - similar to Raise's approach:
+
+```python
+# Azure ML's new DSL (preview) - declarative feature definition
+# This represents a shift toward Raise-like ergonomics
+```
+
+### Uber (Historical - Origin of Feature Stores)
+
+| Component | Technology |
+|-----------|------------|
+| **ML Platform** | [Michelangelo](https://www.uber.com/blog/michelangelo-machine-learning-platform/) |
+| **Feature Store** | **Palette** (industry's first feature store) |
+| **Stack** | HDFS, Spark, Samza, Cassandra, MLLib, XGBoost, TensorFlow |
+
+> "Michelangelo is widely credited as the effort that started the feature store movement."
+
+The founding team of Michelangelo later created **Tecton**, one of the leading commercial feature stores.
+
+### Summary: AI Lab Infrastructure Patterns
+
+| Lab | Primary Focus | Feature Store? | Key Infrastructure |
+|-----|---------------|----------------|-------------------|
+| **OpenAI** | Foundation models | No | Ray, custom distributed training |
+| **Anthropic** | Foundation models | No | Multi-cloud (AWS/GCP), MCP |
+| **DeepMind** | Research + Gemini | Vertex AI (cloud) | JAX, TPUs, TFX |
+| **Meta AI** | Research + Applied | Yes (Palette) | FBLearner, PyTorch, MWFS |
+| **Microsoft** | Cloud + Research | Yes (Azure ML) | Azure ML, declarative DSL |
+
+### Implications for Raise
+
+1. **Foundation model labs don't need traditional feature stores** - their workflows are fundamentally different (pre-training data pipelines vs. feature engineering)
+
+2. **Applied ML teams do need feature stores** - Meta's Palette, Azure ML Feature Store, and Tecton serve real production needs
+
+3. **The industry is moving toward declarative APIs** - Azure ML's DSL preview validates Raise's design direction
+
+4. **Notebook-first research workflows are underserved** - DeepMind uses JAX in notebooks, but feature management is ad-hoc
+
+5. **Raise's target audience is researchers doing applied ML** - not foundation model training, but experiment-heavy research that eventually needs production features
+
+---
+
 ## Conclusions
 
 ### Raise is Better For:
@@ -543,13 +661,38 @@ However, without production infrastructure, Raise is currently a **design protot
 
 ## Sources
 
+### Feature Store Platforms
 - [Feast Documentation](https://docs.feast.dev/)
 - [Feast Quickstart](https://docs.feast.dev/getting-started/quickstart)
 - [Tecton Documentation](https://docs.tecton.ai/)
 - [Tecton Feature Store](https://www.tecton.ai/feature-store/)
+- [Tecton - Our Story](https://www.tecton.ai/about-us/)
 - [Databricks Feature Store](https://docs.databricks.com/aws/en/machine-learning/feature-store/)
 - [Databricks Unity Catalog Feature Tables](https://docs.databricks.com/aws/en/machine-learning/feature-store/uc/feature-tables-uc)
 - [AWS SageMaker Feature Store](https://sagemaker.readthedocs.io/en/stable/amazon_sagemaker_featurestore.html)
 - [SageMaker Feature Store Introduction](https://docs.aws.amazon.com/sagemaker/latest/dg/feature-store-getting-started.html)
 - [Vertex AI Feature Store](https://docs.cloud.google.com/vertex-ai/docs/featurestore/latest/overview)
+- [Azure ML Feature Store](https://learn.microsoft.com/en-us/azure/machine-learning/concept-what-is-managed-feature-store)
 - [Top 5 Feature Stores in 2025](https://www.gocodeo.com/post/top-5-feature-stores-in-2025-tecton-feast-and-beyond)
+
+### Leading AI Labs Infrastructure
+- [OpenAI at Ray Summit](https://thenewstack.io/openai-chats-about-scaling-llms-at-anyscales-ray-summit/)
+- [How Ray Powers ChatGPT](https://thenewstack.io/how-ray-a-distributed-ai-framework-helps-power-chatgpt/)
+- [OpenAI Multi-Datacenter Training](https://semianalysis.com/2024/09/04/multi-datacenter-training-openais/)
+- [Anthropic Engineering Blog](https://www.anthropic.com/engineering)
+- [Anthropic Infrastructure Postmortem](https://www.infoq.com/news/2025/10/anthropic-infrastructure-bugs/)
+- [Anthropic $50B Data Center Investment](https://introl.com/blog/anthropic-50b-fluidstack-data-center-december-2025)
+- [Google DeepMind Year in Review 2025](https://deepmind.google/blog/googles-year-in-review-8-areas-with-research-breakthroughs-in-2025/)
+- [Meta FBLearner Flow](https://engineering.fb.com/2016/05/09/core-infra/introducing-fblearner-flow-facebook-s-ai-backbone/)
+- [Meta Composable Data Management](https://engineering.fb.com/2024/05/22/data-infrastructure/composable-data-management-at-meta/)
+- [Meta GenAI Infrastructure](https://engineering.fb.com/2024/03/12/data-center-engineering/building-metas-genai-infrastructure/)
+- [Meta ML Platform Evolution (TWIML)](https://twimlai.com/article/the-evolution-of-machine-learning-platforms-at-facebook-webcast-recap/)
+- [Inside Meta's AI Infrastructure](https://www.vamsitalkstech.com/ai/industry-spotlight-engineering-the-ai-factory-inside-metas-ai-infrastructure-part-4/)
+- [Uber Michelangelo](https://medium.com/@nlauchande/review-notes-of-ml-platforms-uber-michelangelo-e133eb6031da)
+
+### Frameworks & Tools
+- [Ray - Distributed AI Framework](https://www.ray.io/)
+- [JAX - Google](https://github.com/google/jax)
+- [TensorFlow Extended (TFX)](https://www.tensorflow.org/tfx)
+- [PyTorch 2024 Training Advances (IBM)](https://research.ibm.com/blog/pytorch-2024-training-models)
+- [ML Frameworks 2025 Comparison](https://medium.com/@amitkharche/ai-development-frameworks-in-2025-tensorflow-pytorch-keras-jax-d2eb8ffd06e9)
