@@ -60,11 +60,11 @@ This PRD defines the backend systems and middleware required to support the Rais
 8. **Real-Time Updates**: Support CDC-based live tables for analytics materialization
 9. **ETL/Transformations**: Support data transformation pipelines with SQL and Python, integrated with Airflow
 10. **Incremental Processing**: Checkpoint-based incremental updates with support for late-arriving data
+11. **Feature Serving**: Point lookups by entity key for inference-time feature retrieval
 
 ### Non-Goals (v1)
 
-1. Feature serving at inference time (online store)
-2. Real-time streaming ingestion
+1. Real-time streaming ingestion
 3. Model training integration
 4. Feature monitoring/observability dashboards (built-in UI)
 5. Backfill orchestration (manual backfills supported, automated orchestration deferred)
@@ -240,7 +240,8 @@ CREATE TABLE feature_groups (
     description TEXT,
     owner VARCHAR(256),
     tags VARCHAR(64)[] DEFAULT '{}',
-    entity_keys VARCHAR(128)[] DEFAULT '{}',
+    entity_key VARCHAR(128),          -- primary lookup key (e.g. user_id)
+    entity_dtype VARCHAR(64) NOT NULL DEFAULT 'string',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     UNIQUE(project_id, name)
@@ -500,6 +501,39 @@ Support three modes for `if_exists` parameter:
 | `create_features_from_schema` | `{name: dtype}` dict | Batch insert |
 | `create_features` | List of feature dicts | Batch insert |
 | `create_features_from_file` | YAML/JSON file path | Parse + batch insert |
+
+#### 4.5 Entity Key and Point Lookup (Serving)
+
+Each feature group may declare an `entity_key` — the primary column used to identify rows at serving time (e.g. `user_id`, `item_id`, `doc_id`). This is required for online feature retrieval during model inference.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `entity_key` | `str \| None` | Column name of the primary lookup key |
+| `entity_dtype` | `str` | Data type of the key (`string`, `int64`, `uuid`). Default: `string` |
+
+**Point Lookup API:**
+
+```python
+# Declare entity key at group creation
+user_signals = fs.create_feature_group(
+    "user-signals",
+    entity_key="user_id",
+    entity_dtype="string",
+)
+
+# Fetch all features for a list of entity IDs
+rows = user_signals.get(["u_123", "u_456"])
+# => [{"user_id": "u_123", "click_count": 42, ...}, ...]
+
+# Fetch a subset of features
+rows = user_signals.get(["u_123"], features=["click_count", "revenue"])
+```
+
+**Behavior:**
+- Raises `ValueError` if `entity_key` is not defined on the group
+- Raises `FeatureNotFoundError` if a requested feature name doesn't exist
+- In production, routes to the online store (e.g. Redis, DynamoDB) keyed by `entity_key`
+- Returns `None` for any feature value not present in the online store
 
 ---
 

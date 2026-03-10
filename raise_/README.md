@@ -19,8 +19,8 @@ from raise_ import FeatureStore
 # Connect to the feature store
 fs = FeatureStore("acme/mlplatform/recommendation")
 
-# Create a feature group
-user_signals = fs.create_feature_group("user-signals")
+# Create a feature group with an entity key for serving-time lookups
+user_signals = fs.create_feature_group("user-signals", entity_key="user_id")
 
 # Create features
 user_signals.create_feature("click_count", dtype="int64")
@@ -93,7 +93,7 @@ Control each step explicitly. Useful for debugging, learning, or complex workflo
 org = fs.create_organization("acme")
 domain = fs.create_domain("mlplatform")
 project = fs.create_project("recommendation")
-group = fs.create_feature_group("user-signals")
+group = fs.create_feature_group("user-signals", entity_key="user_id")
 
 # Explicit feature creation with full control
 feature = group.create_feature(
@@ -2209,6 +2209,10 @@ class FeatureStore:
 
 ```python
 class FeatureGroup:
+    # Entity key (set at creation time via entity_key / entity_dtype)
+    entity_key: str | None
+    entity_dtype: str  # default: "string"
+
     def create_feature(self, name: str, dtype: str, **kwargs) -> Feature
     def create_features(self, features: list[dict], **kwargs) -> list[Feature]
     def create_features_from_schema(self, schema: dict, **kwargs) -> list[Feature]
@@ -2217,6 +2221,9 @@ class FeatureGroup:
     def feature(self, name: str) -> Feature
     def list_features(self, tags: list[str] = None, **kwargs) -> list[Feature]
     def validate_feature(self, name: str, dtype: str, **kwargs) -> ValidationResult
+
+    # Serving (requires entity_key)
+    def get(self, entity_ids: list, features: list[str] = None) -> list[dict]
 
     # ACL
     def set_acl(self, acl: ACL) -> None
