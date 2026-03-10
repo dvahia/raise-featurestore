@@ -23,11 +23,15 @@ print(f"Connected: {fs}")
 # Create a Feature Group
 # =============================================================================
 
-# Feature groups organize related features
+# Feature groups organize related features.
+# entity_key declares the primary lookup key (e.g. user_id, item_id).
+# This is required for point lookups at serving time.
 user_signals = fs.create_feature_group(
     "user-signals",
     description="User behavioral signals for recommendation models",
     tags=["user", "behavioral", "ranking"],
+    entity_key="user_id",      # primary key for serving lookups
+    entity_dtype="string",     # type of the entity key (default: "string")
 )
 
 print(f"Created: {user_signals}")
@@ -122,3 +126,19 @@ print(f"\nCreated via path: {score.qualified_name}")
 # Retrieve using path syntax
 retrieved_score = fs.feature("user-signals/relevance_score")
 print(f"Retrieved via path: {retrieved_score.name}")
+
+# =============================================================================
+# Point Lookup (Serving)
+# =============================================================================
+
+# Fetch all features for specific entity IDs
+rows = user_signals.get(["u_123", "u_456", "u_789"])
+print(f"\nPoint lookup ({len(rows)} rows):")
+for row in rows:
+    print(f"  {row}")
+
+# Fetch only specific features for an entity
+rows = user_signals.get(["u_123"], features=["click_count", "impression_count"])
+print(f"\nSelective lookup: {rows}")
+
+print(f"\nEntity key: {user_signals.entity_key} ({user_signals.entity_dtype})")

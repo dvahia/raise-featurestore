@@ -76,6 +76,8 @@ class FeatureGroup:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+    entity_key: str | None = None
+    entity_dtype: str = "string"
 
     # Internal state
     _project: Project | None = field(default=None, repr=False)
@@ -388,6 +390,54 @@ class FeatureGroup:
 
         return sorted(result, key=lambda f: f.name)
 
+    def get(
+        self,
+        entity_ids: list[Any],
+        features: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Look up feature values by entity key (point lookup / serving).
+
+        Args:
+            entity_ids: List of entity key values to fetch (e.g. user IDs).
+            features: Feature names to return. Defaults to all features.
+
+        Returns:
+            List of dicts, one per entity ID, with the entity key and
+            requested feature values. Missing values are returned as None.
+
+        Raises:
+            ValueError: If this feature group has no entity_key defined.
+
+        Example:
+            >>> user_signals = fs.feature_group("user-signals")
+            >>> rows = user_signals.get(["u_123", "u_456"])
+            >>> rows = user_signals.get(["u_123"], features=["click_count", "revenue"])
+        """
+        if self.entity_key is None:
+            raise ValueError(
+                f"Feature group '{self.name}' has no entity_key defined. "
+                "Set entity_key when calling create_feature_group()."
+            )
+
+        feature_names = features or list(self._features.keys())
+
+        # Validate requested feature names
+        unknown = [f for f in feature_names if f not in self._features]
+        if unknown:
+            raise FeatureNotFoundError(unknown[0], self.qualified_name)
+
+        # Simulate point lookup — in production this hits the online store
+        results = []
+        for eid in entity_ids:
+            row: dict[str, Any] = {self.entity_key: eid}
+            for fname in feature_names:
+                feature = self._features[fname]
+                row[fname] = feature.default  # online store would return real value
+            results.append(row)
+
+        return results
+
     def validate_feature(
         self,
         name: str,
@@ -606,6 +656,8 @@ class FeatureGroup:
             "metadata": self.metadata,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "entity_key": self.entity_key,
+            "entity_dtype": self.entity_dtype,
             "features": [f.to_dict() for f in self._features.values()],
         }
 
@@ -634,6 +686,8 @@ class FeatureGroup:
             metadata=data.get("metadata", {}),
             created_at=created_at,
             updated_at=updated_at,
+            entity_key=data.get("entity_key"),
+            entity_dtype=data.get("entity_dtype", "string"),
             _project=project,
         )
 

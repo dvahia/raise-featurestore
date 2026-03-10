@@ -363,6 +363,8 @@ class FeatureStore:
         owner: str | None = None,
         acl: ACL | None = None,
         metadata: dict[str, Any] | None = None,
+        entity_key: str | None = None,
+        entity_dtype: str = "string",
         if_exists: Literal["error", "skip", "update"] = "error",
     ) -> FeatureGroup:
         """
@@ -375,6 +377,8 @@ class FeatureStore:
             owner: Owner identifier.
             acl: Access control list.
             metadata: Arbitrary metadata.
+            entity_key: Primary key column name for point lookups (e.g. "user_id").
+            entity_dtype: Data type of the entity key (default: "string").
             if_exists: Behavior if group exists.
 
         Returns:
@@ -388,6 +392,8 @@ class FeatureStore:
             owner=owner,
             acl=acl,
             metadata=metadata,
+            entity_key=entity_key,
+            entity_dtype=entity_dtype,
             if_exists=if_exists,
         )
 

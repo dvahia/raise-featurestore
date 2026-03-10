@@ -72,6 +72,8 @@ class Project:
         owner: str | None = None,
         acl: ACL | None = None,
         metadata: dict[str, Any] | None = None,
+        entity_key: str | None = None,
+        entity_dtype: str = "string",
         if_exists: Literal["error", "skip", "update"] = "error",
     ) -> FeatureGroup:
         """
@@ -84,6 +86,8 @@ class Project:
             owner: Owner identifier (defaults to project owner).
             acl: Access control (defaults to inherit from project).
             metadata: Arbitrary metadata.
+            entity_key: Primary key column name for point lookups (e.g. "user_id").
+            entity_dtype: Data type of the entity key (default: "string").
             if_exists: Behavior if group exists ("error", "skip", "update").
 
         Returns:
@@ -107,6 +111,8 @@ class Project:
             owner=owner or self.owner,
             acl=acl or ACL(),
             metadata=metadata or {},
+            entity_key=entity_key,
+            entity_dtype=entity_dtype,
             _project=self,
         )
 
