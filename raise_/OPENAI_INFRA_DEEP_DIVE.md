@@ -10,14 +10,23 @@ OpenAI is deliberately opaque about their stack starting with GPT-4 ("the report
 
 | Phase | Primary Infrastructure |
 |---|---|
-| Data acquisition | CommonCrawl WARC files, Azure Blob Storage |
-| Signal computation | Custom Python + distributed compute (Ray/Spark), FastText, KenLM |
+| Data acquisition | CommonCrawl WARC → Azure Blob Storage (raw), Parquet (processed) |
+| Storage (raw) | Azure Data Lake / Blob: cold tier for WARCs, warm for Parquet |
+| Storage (enriched) | Apache Iceberg or Delta Lake on Azure ADLS Gen2 for ACID signal writes |
+| Training-time storage | MDS (Mosaic Data Shard) or packed Parquet shards on NVMe |
+| Signal computation | Ray/Spark workers, FastText, KenLM, custom PyTorch classifiers |
+| Signal versioning | Column-at-a-time writes via Iceberg schema evolution |
+| Compliance filtering | Multi-stage batch: regex → FastText → neural classifiers, audit log per doc |
 | Dedup | MinHash LSH + exact 50-token span matching |
+| Pipeline orchestration | Apache Airflow DAGs + custom Ray DAG pipelines |
+| Pipeline monitoring | Datadog / Prometheus + Great Expectations + row-count anomaly detection |
+| Dataset exploration | DuckDB over Parquet, Jupyter notebooks, custom Streamlit/Gradio viewers |
+| Lineage tracking | Document-level metadata sidecar + Parquet file metadata headers |
 | Experiment (small scale) | Scaling law extrapolation, Ray Tune, W&B |
 | Hero run (training) | Azure NDm A100 v4 → GB300 NVL72, NCCL + InfiniBand, PyTorch + Triton |
 | Parallelism | 3D parallel: tensor + pipeline + data (PTD-P) |
 | Checkpointing | Azure Blob Storage, every ~30–60 min |
-| Monitoring | W&B + custom dashboards |
+| Training monitoring | W&B + custom dashboards |
 | SFT annotation | Scale AI + direct contractor pool |
 | RLHF orchestration | Ray (policy, critic, reward, reference model placement) |
 | RLHF inference | vLLM + Ray for policy rollouts during PPO |
@@ -82,6 +91,285 @@ OpenAI explicitly states the GPT-4 Technical Report "contains no further details
 - **LLM-based quality scoring**: FineWeb (HuggingFace, 2024) explicitly models GPT-4 data practices using GPT-4 as a quality scorer on a sample, then distilling into a FastText classifier. The implication: OpenAI uses or used LLM judges to assign quality scores at corpus scale, then trains a cheaper classifier to apply the judgment at scale.
 - **Multimodal data**: GPT-4V implies a pre-training corpus that includes image-text pairs, image captions, OCR'd documents, and interleaved image-text data.
 - **Stricter safety filtering**: The GPT-4 system card describes more aggressive content filtering than GPT-3.
+
+---
+
+## Phase 1b: Data Engineering Infrastructure
+
+This section covers the infrastructure layer that sits beneath the ML pipeline described in Phase 1 — the storage systems, processing engines, monitoring, and tooling that make it possible for hundreds of researchers to work against the same massive dataset without stepping on each other.
+
+### Storage Architecture: Three Tiers
+
+Pre-training data at AI lab scale lives in three distinct storage tiers, each optimized for a different access pattern:
+
+```
+Tier 1 — Raw Archive (cold)
+  Format:  WARC (Web ARChive) files from CommonCrawl
+  Storage: Azure Blob Storage / ADLS Gen2, cold access tier
+  Size:    45–100+ TB per monthly CommonCrawl shard (OpenAI downloads 41 shards)
+  Access:  Read once during extraction; rarely touched again
+  Cost:    Cheapest per GB; high latency acceptable
+
+Tier 2 — Processed & Signal-Enriched (warm)
+  Format:  Apache Parquet, partitioned by domain/language/crawl-date
+  Storage: Azure Data Lake Storage (ADLS) Gen2 or S3-compatible
+  Size:    Fraction of Tier 1 after filtering (GPT-3: 45 TB → 570 GB retained)
+  Access:  Read/write during signal computation; read during mixing/training prep
+  Cost:    Mid-range; SSD-backed for interactive query, HDD for bulk
+
+Tier 3 — Training-Ready (hot)
+  Format:  MDS (Mosaic Data Shard) or packed Parquet shards
+  Storage: NVMe SSDs local to training nodes OR high-throughput distributed store
+  Size:    Final training set; aggressively compressed
+  Access:  Random-access streaming during training; must sustain GB/s throughput
+  Cost:    Most expensive; sized to avoid GPU starvation
+```
+
+**WARC → text extraction**: The first pipeline stage reads raw WARC files and extracts clean text. The dominant open-source tools are Trafilatura (linguistic quality-focused), Resiliparse (speed-focused), and CCNet (Facebook, used for CCNet corpus and mC4). The output is JSONL — one JSON object per document with extracted text, URL, crawl date, and language.
+
+**JSONL → Parquet**: After text extraction, documents are written to **Apache Parquet** partitioned by crawl shard and language. Parquet's columnar format is critical here: when a researcher wants to read only the `text` and `url_domain` columns across 100B documents, Parquet reads only those column files rather than full rows — a 10–50x I/O reduction vs. row-oriented formats.
+
+**Partitioning strategy**: Typical partition scheme:
+```
+/data/processed/
+  year=2024/month=03/language=en/shard=00001.parquet
+  year=2024/month=03/language=zh/shard=00001.parquet
+  ...
+```
+
+This allows queries like "give me all English documents from Q1 2024" to skip irrelevant partitions entirely (partition pruning), which at petabyte scale is the difference between a 10-minute query and a 10-hour one.
+
+### The Signal Enrichment Problem: Concurrent Writes at Scale
+
+The hardest data engineering problem in pre-training pipelines is supporting **concurrent signal enrichment** — multiple teams computing different signals against the same base corpus simultaneously, without conflicts or full rewrites.
+
+**The naive approach** — recompute the entire Parquet file every time a new signal is added — doesn't scale. A 570 GB corpus takes hours to rewrite. If 10 teams are computing signals in parallel, you'd need to coordinate them into a single batch, which serializes the research process.
+
+**The Iceberg/Delta Lake approach** (what labs almost certainly use at scale):
+
+**Apache Iceberg** and **Delta Lake** are open table formats that add ACID transactions, schema evolution, and time-travel to Parquet files on object storage. The key capabilities for signal enrichment:
+
+1. **Schema evolution without rewrite**: Adding a new column (`educational_quality_score`) to a 100B-row Iceberg table doesn't rewrite existing data. Iceberg records the column addition in its metadata layer; existing files simply return `null` for the new column until their rows are backfilled.
+
+2. **Column-at-a-time writes**: The perplexity team and the language ID team can write their signals as separate Iceberg merge operations targeting different columns. Iceberg's optimistic concurrency control (OCC) lets these run in parallel and resolves any conflicts via snapshot isolation — each operation sees a consistent snapshot of the table.
+
+3. **Time-travel**: `SELECT * FROM documents VERSION AS OF '2024-03-15'` returns the table as it existed on that date — before the dedup run was applied. This lets a researcher reproduce any earlier experiment exactly, even after signals have been updated or records deleted.
+
+4. **Hidden partitioning**: Iceberg can automatically maintain hidden partition metadata (e.g., partition by language) even as the schema evolves, without requiring users to know the physical layout.
+
+**In practice at Meta** (the most documented case): Meta uses a similar pattern for their production feature platform. Palette (their feature store) uses columnar storage with append/update operations rather than full rewrites. The design principle — signals are columns, and columns can be added independently — is the same.
+
+**The alternative pattern** (simpler, used at smaller scale): Keep signals in **separate Parquet stores**, one per signal type or team. Merge at read time via a join on `doc_id`. This eliminates write conflicts entirely (each team owns their store) at the cost of join overhead at query time. For exploration and experimentation this is often sufficient; for the final training pipeline the stores are merged into a single enriched Parquet.
+
+### Storage Format for Training: MDS
+
+Once the signal-enriched dataset is filtered and mixed, it's converted into a format optimized for **streaming during training**. The dominant open-source format is **MDS (Mosaic Data Shard)** from MosaicML (now Databricks):
+
+```
+training_data/
+  shard_00001.mds   ← binary, ~256 MB per shard
+  shard_00002.mds
+  ...
+  index.json        ← shard manifest with record counts, byte offsets
+```
+
+Each MDS shard is a binary file containing fixed-size records. The training data loader:
+1. Reads `index.json` to learn the total record count and shard layout
+2. Shuffles at the shard level (not record level — too expensive at this scale)
+3. Streams shards from storage (Azure Blob / S3) with prefetching
+4. Decodes records in parallel on CPU workers while GPU trains
+
+MDS achieves **near-disk-speed streaming throughput** even from object storage because it reads sequential large chunks rather than random small reads. For a 15T-token dataset, the data loader must sustain ~10–50 GB/s to avoid GPU starvation on a large cluster — impossible with row-at-a-time access, achievable with sequential shard streaming.
+
+### Compliance Filtering Pipeline: Multi-Stage Architecture
+
+Safety and compliance filtering at 100B+ document scale uses a **multi-stage funnel** design — fast cheap filters first, expensive accurate filters only on survivors. The design principle: at 100B documents, even a 1ms per-document operation takes 28 CPU-hours. A 100ms LLM inference call on every document is simply not feasible.
+
+```
+Stage 1 — URL blocklists (nanoseconds/doc)
+  Adult domain blocklists, known spam domains, DMCA takedown lists
+  Applied at WARC level before text extraction
+  Eliminates ~5–15% of documents
+
+Stage 2 — Heuristic rules (microseconds/doc)
+  Regex patterns: SSN, credit card numbers, email addresses (PII detection)
+  Symbol density thresholds (>50% non-alphanumeric → likely code dump/spam)
+  Short document filters (<50 tokens → insufficient signal)
+  Applied in vectorized Python/Numpy on Spark executors
+  Eliminates an additional 10–30%
+
+Stage 3 — FastText classifiers (milliseconds/doc)
+  Language identification (FastText lid.176.bin — 176 languages, ~0.5ms/doc)
+  Coarse NSFW classifier (FastText trained on labeled adult/non-adult URLs)
+  Hate speech coarse classifier (FastText trained on toxic/non-toxic samples)
+  Applied as Spark UDFs; trivially parallelized across executors
+  Eliminates an additional 5–20%
+
+Stage 4 — Neural classifiers (10–100ms/doc, on GPU workers)
+  Fine-grained NSFW classifier (CNN or small transformer, trained on labeled images/text)
+  PII NER model (BERT-based, identifies named personal information in context)
+  Copyright signal classifier (identifies likely copyrighted verbatim passages)
+  Run only on documents that pass Stages 1–3; ~50% of original corpus
+  Applied on GPU workers via Ray or Spark + GPU support
+  Eliminates an additional 5–15%
+
+Stage 5 — LLM-based judgment (seconds/doc, on GPU; run on sample only)
+  GPT-4 / Claude quality scoring on representative sample (~500K documents)
+  Used to train Stage 3/4 classifiers, not applied to full corpus
+  Output: labeled training data for cheaper classifiers
+```
+
+**Audit trail**: Each filtering stage writes a decision record — `{"doc_id": "...", "stage": 3, "classifier": "fasttext_nsfw_v2.1", "score": 0.94, "threshold": 0.8, "action": "filter"}` — to a separate audit log Parquet. This audit log is critical for:
+- Reproducing filtering decisions when a pipeline version changes
+- Debugging unexpected data quality drops
+- Compliance documentation (demonstrating due diligence for specific content categories)
+- Comparing across classifier versions (did v2.2 filter more or fewer docs than v2.1?)
+
+**Soft vs. hard filtering**: "Hard" filtering removes documents entirely; "soft" filtering adds a score column but keeps the document, allowing downstream consumers to apply their own threshold. Most labs use soft filtering — the `is_nsfw`, `nsfw_score`, `pii_score` columns are written to the enriched Parquet, and `include_in_training = (nsfw_score < 0.3 AND pii_score < 0.5 AND ...)` is computed as a derived column. This preserves the document and all its signals, enabling researchers to explore the effect of different thresholds without re-running classifiers.
+
+### Pipeline Orchestration
+
+Data preparation pipelines at AI lab scale are **long-running batch workflows** with complex dependencies between stages. A full CommonCrawl processing pipeline might look like:
+
+```
+WARC download → text extraction → language ID → quality scoring → dedup → compliance → mixing
+```
+
+Each stage depends on the previous one, takes hours to days to complete, and can fail partway through. The orchestration layer must handle:
+- **DAG scheduling**: run dedup only after quality scoring is done
+- **Distributed execution**: each stage runs as hundreds or thousands of parallel Spark tasks
+- **Failure recovery**: if quality scoring fails on shard 4,523 of 10,000, resume from that shard
+- **Progress tracking**: humans watching a multi-day job need status updates
+- **Data version gating**: only proceed to next stage if the output passed data quality checks
+
+**Apache Airflow** is the industry standard for this use case, and the most likely choice at OpenAI based on job postings referencing "data orchestration" and the prevalence of Airflow in Meta's documented stack. Airflow represents the pipeline as a DAG of tasks; each task is a Spark submit, a Ray job, or a Python function. Tasks have retry policies, SLAs, and dependency declarations.
+
+A typical Airflow DAG for data curation:
+```python
+with DAG("web_curation_2024_03", schedule="@monthly") as dag:
+    extract    = SparkSubmitOperator(task_id="extract_text",    ...)
+    lang_id    = SparkSubmitOperator(task_id="language_id",     ...)
+    quality    = RayJobOperator(task_id="quality_scoring",      ...)
+    dedup      = SparkSubmitOperator(task_id="minhash_dedup",   ...)
+    compliance = RayJobOperator(task_id="compliance_filter",    ...)
+    validate   = PythonOperator(task_id="data_quality_check",   ...)
+    publish    = IcebergWriteOperator(task_id="publish_shard",  ...)
+
+    extract >> lang_id >> quality >> dedup >> compliance >> validate >> publish
+```
+
+**Failure recovery for long Spark jobs**: The standard pattern is **checkpoint-based recovery** — Spark jobs write intermediate results to durable storage (Azure Blob) at regular intervals (every N shards). If the job fails, it restarts from the last checkpoint rather than from scratch. For a 3-day job that fails on day 2, this limits rework to a few hours rather than two full days.
+
+**Ray DAGs** are used for Python-native pipelines that are more dynamic than Spark can express — for example, an LLM-based quality scoring pipeline where the batch size per worker depends on document length.
+
+### Pipeline Monitoring and Failure Management
+
+Data pipelines at this scale fail constantly — not catastrophically, but with a steady background rate of infrastructure failures, quota exhaustion, data format surprises, and network timeouts. The monitoring stack must distinguish "this task failed and needs a page" from "this shard had 3% corrupt documents which is within normal range."
+
+**Infrastructure monitoring** (Datadog or Prometheus + Grafana):
+- Spark executor health: memory usage, GC time, task failure rate per executor
+- Ray worker health: GPU utilization, memory, task queue depth
+- Azure Blob / ADLS read/write throughput and error rates
+- Pipeline progress: shards processed / total shards, estimated completion time
+
+**Data quality monitoring** (the harder problem):
+- **Row count anomaly detection**: after quality filtering, the expected pass rate is ~2%. If a new run passes 0.5% or 8%, something changed — either the data or the classifier. Automated anomaly detection (Z-score or ARIMA-based) on pass rates alerts the pipeline team.
+- **Distribution drift**: the distribution of quality scores, language codes, and domain sources should be stable across monthly CommonCrawl shards. A sudden shift (e.g., language ID returns 80% English vs. the usual 45%) indicates a classifier bug or a crawl artifact.
+- **Great Expectations**: the open-source data validation framework, widely used for defining "expectations" (assertions about data) that run after each pipeline stage. Example expectations: `expect_column_values_to_be_between("quality_score", 0.0, 1.0)`, `expect_column_proportion_of_unique_values_to_be_between("doc_id", 0.99, 1.0)`. Failed expectations block pipeline progression and trigger alerts.
+- **Schema drift alerts**: if the output Parquet has an unexpected column or a column changes type, the pipeline fails with a descriptive error rather than silently writing corrupt data.
+
+**On-call rotation**: Meta, Google, and likely OpenAI maintain a data infrastructure on-call rotation — an engineer paged for any pipeline failure that blocks a downstream training run. The SLA for pre-training pipelines is typically "unblock within 4 hours for any failure affecting an in-progress hero run."
+
+**Common failure modes and mitigations**:
+
+| Failure | Detection | Mitigation |
+|---|---|---|
+| Spark executor OOM | Executor logs, task retry rate spike | Increase executor memory, reduce partition size |
+| Azure Blob quota throttling | HTTP 429 error rate in Datadog | Retry with exponential backoff, increase quota |
+| FastText classifier segfault | Task failure with non-zero exit code | Isolate in subprocess with timeout; skip + log bad doc |
+| Corrupt WARC shard | Parse errors > 1% on a shard | Mark shard as bad, skip and alert |
+| Quality score distribution shift | Great Expectations check fails | Block pipeline, diff classifier version, human review |
+| Dedup graph too large for memory | Spark stage failure | Repartition into smaller components, use disk spill |
+
+### Dataset Exploration and Visualization
+
+A 15-trillion-token dataset is not something you can `head -n 10` and understand. Researchers need purpose-built tooling to answer questions like: "What fraction of our code data is Python vs. JavaScript?", "Why did the quality score drop for the March 2024 crawl?", "Show me 20 representative examples of documents that passed safety filtering but look borderline."
+
+**The query layer — DuckDB**: DuckDB has become the standard tool for interactive exploration of Parquet files at scales that don't fit in Pandas (up to a few TB on a laptop). It reads Parquet columns directly, pushes down filters to avoid unnecessary I/O, and returns results in seconds for queries over files that would take hours in Spark.
+
+```python
+import duckdb
+conn = duckdb.connect()
+
+# Distribution of quality scores — runs in seconds on a 50 GB Parquet
+conn.execute("""
+    SELECT
+        FLOOR(quality_score * 10) / 10 AS score_bucket,
+        COUNT(*) AS doc_count,
+        AVG(token_count) AS avg_tokens
+    FROM read_parquet('adls://datasets/processed/year=2024/month=03/language=en/*.parquet')
+    WHERE quality_score IS NOT NULL
+    GROUP BY 1
+    ORDER BY 1
+""").df()
+
+# Sample 100 borderline-NSFW documents for human review
+conn.execute("""
+    SELECT doc_id, url, text[:500], nsfw_score
+    FROM read_parquet('...')
+    WHERE nsfw_score BETWEEN 0.4 AND 0.6
+    ORDER BY RANDOM()
+    LIMIT 100
+""").df()
+```
+
+**Jupyter notebooks** are the primary research interface for dataset analysis. Researchers write notebooks that:
+- Load signal distributions from Parquet via DuckDB
+- Plot histograms and CDFs of quality scores, token counts, language distributions
+- Sample and display documents for qualitative inspection
+- Run A/B comparisons: "what does the data filtered at threshold 0.5 look like vs. 0.65?"
+- Generate reports that become artifacts in the data version's provenance record
+
+**Custom visualization dashboards** for the data team: Typically a **Streamlit** or **Gradio** app that exposes:
+- A random document sampler with filter controls (language, domain, score range)
+- Side-by-side comparison of two dataset versions
+- A "problematic document" viewer (high nsfw score, high perplexity, flagged for review)
+- Domain distribution treemaps (what fraction of the corpus comes from `.edu`, `.gov`, Reddit, Wikipedia, etc.)
+- Quality score time series (how has the average quality score changed across monthly crawls?)
+
+**Lilac** (open-source from HuggingFace): A data curation tool specifically designed for ML datasets. Supports semantic search over dataset examples, clustering by embedding similarity, and labeling interfaces. Used by smaller teams; at OpenAI scale the data volumes require custom tooling.
+
+**The data room**: For sensitive datasets (containing PII, safety-relevant content, or legally sensitive material), a "data room" is an isolated compute environment where researchers can explore examples without exfiltration risk. All queries run inside the data room; only aggregated statistics are exported. This is the standard approach for handling RLHF data that contains user conversations.
+
+### Data Lineage: The Provenance Problem at 100B Scale
+
+Lineage answers the question: "which processing steps, with which versions, produced this document in the final training set?" At 100B+ document scale, maintaining per-document lineage is itself a significant engineering problem.
+
+**Document-level metadata** (what goes in the Parquet): Every document carries a `pipeline_run_id` and a set of signal version tags in its row:
+```json
+{
+  "doc_id": "cc-2024-10-00001-en-0000042",
+  "pipeline_run_id": "run-2024-03-15-v4.2",
+  "quality_scorer_version": "kenlm-v3.1",
+  "dedup_run_id": "dedup-2024-03-17",
+  "nsfw_classifier_version": "fasttext-nsfw-v2.1",
+  "include_in_training": true,
+  "quality_score": 0.73,
+  ...
+}
+```
+
+**File-level metadata** (what goes in the Parquet file header): Apache Parquet supports key-value metadata in the file footer — a place to store pipeline version, processing date, source shard ID, and a checksum of the input data. This enables coarse lineage ("this Parquet file was produced by pipeline run X from source shard Y") without per-row overhead.
+
+**Iceberg's built-in lineage**: Apache Iceberg maintains a full snapshot history — every table write creates a new snapshot, and older snapshots are retained for a configurable period. This gives time-travel (see the table as it was at any past point) and coarse lineage (which operation created which snapshot). Iceberg doesn't provide column-level or row-level lineage natively, but snapshot metadata can record the pipeline run that created each snapshot.
+
+**What labs actually do in practice**: The honest answer, based on public dataset documentation and job posting language, is that most labs maintain lineage via a combination of:
+1. Per-document metadata columns (the version tags above)
+2. Parquet file metadata headers
+3. Pipeline configuration files in Git (which pipeline version ran when)
+4. README files in object storage prefixes documenting each major processing step
+
+**What labs don't have**: A unified lineage graph system (like Apache Atlas or DataHub) that traces from raw WARC shard → extracted text → quality-scored → deduped → filtered → mixed → training shard at the individual document level. This doesn't exist at production scale at any lab. Building it is part of what Raise is designed to do — `DatasetVersion.derive()` and the job system provide the managed lineage layer that labs currently reconstruct from README files.
 
 ---
 
@@ -489,6 +777,21 @@ Raise's role in this stack is not to replace Ray (execution), Azure (compute), S
 ---
 
 ## Sources
+
+### Data Engineering Infrastructure
+- [Apache Iceberg: A Table Format for Huge Analytic Datasets](https://iceberg.apache.org/docs/latest/)
+- [Delta Lake: High-Performance ACID Table Storage](https://docs.delta.io/latest/index.html)
+- [MosaicML Streaming (MDS format)](https://docs.mosaicml.com/projects/streaming/en/stable/)
+- [Apache Airflow Documentation](https://airflow.apache.org/docs/)
+- [Great Expectations: Data Quality](https://docs.greatexpectations.io/)
+- [DuckDB: In-Process Analytical Database](https://duckdb.org/docs/)
+- [Lilac: Dataset Exploration Tool](https://lilacml.com/)
+- [Dolma Tagger Framework — AllenAI](https://github.com/allenai/dolma)
+- [CCNet: Extracting High Quality Monolingual Datasets from Web Crawl Data](https://arxiv.org/abs/1911.00359)
+- [Meta: Composable Data Management](https://engineering.fb.com/2024/05/22/data-infrastructure/composable-data-management-at-meta/)
+- [Meta: FBLearner Flow](https://engineering.fb.com/2016/05/09/core-infra/introducing-fblearner-flow-facebook-s-ai-backbone/)
+- [DataHub: Data Discovery and Lineage](https://datahubproject.io/)
+- [OpenLineage: Open Standard for Data Lineage](https://openlineage.io/)
 
 ### Pre-Training Data
 - [Language Models are Few-Shot Learners (GPT-3) — arXiv:2005.14165](https://arxiv.org/abs/2005.14165)
