@@ -89,6 +89,24 @@ class QualityScorer(Transform):
                 return t
         return None
 
+    def get_sql(self, context: Any) -> None:
+        return None  # Python-based; no SQL
+
+    def to_dict(self) -> dict:
+        return {
+            "transform_type": "python",
+            "class": "QualityScorer",
+            "name": self.name,
+            "description": self.description,
+            "dimensions": [d.value for d in self.dimensions],
+            "thresholds": [{"dimension": t.dimension.value, "min_score": t.min_score} for t in self.thresholds],
+            "model_uri": self.model_uri,
+            "input_columns": self.input_columns,
+            "composite_column": self.composite_column,
+            "write_per_dimension": self.write_per_dimension,
+            "filter_below_threshold": self.filter_below_threshold,
+        }
+
     def with_threshold(self, dimension: QualityDimension, min_score: float) -> "QualityScorer":
         """Return a new scorer with an added/updated threshold."""
         existing = [t for t in self.thresholds if t.dimension != dimension]
@@ -147,6 +165,25 @@ class DeduplicationTransform(Transform):
     def output_columns(self) -> list[str]:
         return [self.is_duplicate_column, self.duplicate_of_column]
 
+    def get_sql(self, context: Any) -> None:
+        return None
+
+    def to_dict(self) -> dict:
+        return {
+            "transform_type": "python",
+            "class": "DeduplicationTransform",
+            "name": self.name,
+            "description": self.description,
+            "config": {
+                "algorithm": self.config.algorithm.value,
+                "threshold": self.config.threshold,
+                "key_columns": self.config.key_columns,
+                "action": self.config.action,
+            },
+            "is_duplicate_column": self.is_duplicate_column,
+            "duplicate_of_column": self.duplicate_of_column,
+        }
+
 
 # =============================================================================
 # Compliance Filtering
@@ -196,6 +233,20 @@ class ComplianceFilterTransform(Transform):
         for rule in self.policy.rules:
             cols.append(rule.output_column or f"compliance_{rule.flag.value}")
         return cols
+
+    def get_sql(self, context: Any) -> None:
+        return None
+
+    def to_dict(self) -> dict:
+        return {
+            "transform_type": "python",
+            "class": "ComplianceFilterTransform",
+            "name": self.name,
+            "description": self.description,
+            "policy": self.policy.name,
+            "input_columns": self.input_columns,
+            "passed_column": self.passed_column,
+        }
 
 
 # =============================================================================

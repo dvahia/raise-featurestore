@@ -273,17 +273,27 @@ class FeatureGroupSource(Source):
         feature_group: Feature group path (e.g., "org/domain/project/group")
         features: List of feature names to read (None = all)
         version: Feature version to read (None = latest)
-        filter: SQL WHERE clause filter
+        filter: Single SQL WHERE clause filter string
+        filters: List of SQL WHERE clause conditions (ANDed together). Takes
+                 precedence over `filter` when both are provided.
     """
 
     feature_group: str = ""
     features: list[str] | None = None
     version: str | None = None
     filter: str | None = None
+    filters: list[str] | None = None
 
     @property
     def source_type(self) -> SourceType:
         return SourceType.FEATURE_GROUP
+
+    @property
+    def effective_filter(self) -> str | None:
+        """Return a single SQL filter expression combining all filters."""
+        if self.filters:
+            return " AND ".join(f"({f})" for f in self.filters)
+        return self.filter
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -292,7 +302,7 @@ class FeatureGroupSource(Source):
             "feature_group": self.feature_group,
             "features": self.features,
             "version": self.version,
-            "filter": self.filter,
+            "filter": self.effective_filter,
         }
 
     @classmethod

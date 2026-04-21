@@ -369,7 +369,7 @@ mix_job = fs.create_job(
         FROM source
         WHERE RAND() < :sample_rate   -- reservoir sampling per source
         """,
-        params={
+        parameters={
             "source_weight": weighted_mix.normalized_weights()[0],  # per-source in real execution
             "sample_rate": 0.001,     # placeholder; real rate set per source
         },

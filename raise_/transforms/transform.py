@@ -59,7 +59,7 @@ class Transform(ABC):
     Transforms define how to convert source data into feature data.
     """
 
-    name: str
+    name: str = ""
     description: str | None = None
     owner: str | None = None
     tags: list[str] = field(default_factory=list)

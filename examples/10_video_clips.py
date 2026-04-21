@@ -172,7 +172,7 @@ def extract_clips(
     video_ref: BlobReference,
     video_id: str,
     clip_duration_sec: float = 10.0,
-    stride_sec: float | None = None,
+    stride_sec: "float | None" = None,
     overlap: float = 0.0,
 ) -> list[dict]:
     """
