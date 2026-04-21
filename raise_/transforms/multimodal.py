@@ -96,6 +96,49 @@ class BlobStatus(Enum):
 
 
 # =============================================================================
+# Time Range (for clips within media files)
+# =============================================================================
+
+@dataclass(frozen=True)
+class TimeRange:
+    """
+    A time range within a media file, used to reference clips.
+
+    Args:
+        start_sec: Start time in seconds (inclusive).
+        end_sec: End time in seconds (exclusive).
+
+    Examples:
+        >>> clip_range = TimeRange(start_sec=30.0, end_sec=90.0)
+        >>> clip_range.duration_sec
+        60.0
+    """
+    start_sec: float
+    end_sec: float
+
+    def __post_init__(self):
+        if self.start_sec < 0:
+            raise ValueError(f"start_sec must be non-negative, got {self.start_sec}")
+        if self.end_sec <= self.start_sec:
+            raise ValueError(f"end_sec ({self.end_sec}) must be greater than start_sec ({self.start_sec})")
+
+    @property
+    def duration_sec(self) -> float:
+        """Duration of the clip in seconds."""
+        return self.end_sec - self.start_sec
+
+    def to_dict(self) -> dict:
+        return {"start_sec": self.start_sec, "end_sec": self.end_sec}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TimeRange":
+        return cls(start_sec=data["start_sec"], end_sec=data["end_sec"])
+
+    def __repr__(self) -> str:
+        return f"TimeRange({self.start_sec:.3f}s – {self.end_sec:.3f}s, {self.duration_sec:.3f}s)"
+
+
+# =============================================================================
 # Blob Reference
 # =============================================================================
 
@@ -139,6 +182,9 @@ class BlobReference:
     version_id: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     metadata: dict[str, Any] = field(default_factory=dict, hash=False)
+
+    # Optional time range for clips within a media file (audio/video)
+    time_range: TimeRange | None = field(default=None, hash=False)
 
     # Internal tracking
     _registry_id: str | None = field(default=None, repr=False, hash=False)
@@ -205,13 +251,61 @@ class BlobReference:
             return ct.value.startswith("video/")
         return str(ct).startswith("video/")
 
+    @property
+    def is_clip(self) -> bool:
+        """True if this reference points to a sub-range of a media file."""
+        return self.time_range is not None
+
+    @property
+    def duration_sec(self) -> float | None:
+        """Duration in seconds for clip references, None for full-file references."""
+        if self.time_range is not None:
+            return self.time_range.duration_sec
+        return self.metadata.get("duration_sec")
+
+    def clip(self, start_sec: float, end_sec: float) -> "BlobReference":
+        """
+        Create a clip reference pointing to a time range within this media file.
+
+        The returned reference shares the same URI and checksum as the source
+        file; the time range is stored as metadata so downstream consumers know
+        which segment to read.
+
+        Args:
+            start_sec: Clip start time in seconds (inclusive).
+            end_sec: Clip end time in seconds (exclusive).
+
+        Returns:
+            A new BlobReference with the time_range set.
+
+        Example:
+            >>> video_ref = registry.register(uri="s3://bucket/video.mp4", ...)
+            >>> clip = video_ref.clip(start_sec=30.0, end_sec=90.0)
+            >>> clip.is_clip
+            True
+            >>> clip.time_range.duration_sec
+            60.0
+        """
+        return BlobReference(
+            uri=self.uri,
+            content_type=self.content_type,
+            checksum=self.checksum,
+            hash_algorithm=self.hash_algorithm,
+            size_bytes=self.size_bytes,
+            etag=self.etag,
+            version_id=self.version_id,
+            created_at=self.created_at,
+            metadata=self.metadata,
+            time_range=TimeRange(start_sec=start_sec, end_sec=end_sec),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize reference to dictionary."""
         ct = self.content_type
         if isinstance(ct, ContentType):
             ct = ct.value
 
-        return {
+        d = {
             "uri": self.uri,
             "content_type": ct,
             "checksum": self.checksum,
@@ -222,10 +316,16 @@ class BlobReference:
             "created_at": self.created_at.isoformat(),
             "metadata": self.metadata,
         }
+        if self.time_range is not None:
+            d["time_range"] = self.time_range.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BlobReference":
         """Deserialize reference from dictionary."""
+        time_range = None
+        if "time_range" in data and data["time_range"] is not None:
+            time_range = TimeRange.from_dict(data["time_range"])
         return cls(
             uri=data["uri"],
             content_type=data["content_type"],
@@ -236,6 +336,7 @@ class BlobReference:
             version_id=data.get("version_id"),
             created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.utcnow(),
             metadata=data.get("metadata", {}),
+            time_range=time_range,
         )
 
     def with_metadata(self, **kwargs) -> "BlobReference":
@@ -251,6 +352,7 @@ class BlobReference:
             version_id=self.version_id,
             created_at=self.created_at,
             metadata=new_metadata,
+            time_range=self.time_range,
         )
 
 

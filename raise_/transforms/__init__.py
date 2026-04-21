@@ -92,6 +92,7 @@ from raise_.transforms.client import TransformsClient
 
 from raise_.transforms.multimodal import (
     # Core types
+    TimeRange,
     BlobReference,
     BlobRegistry,
     BlobStatus,
@@ -110,6 +111,13 @@ from raise_.transforms.multimodal import (
     # Utilities
     create_reference,
     infer_content_type,
+)
+
+from raise_.transforms.curation import (
+    QualityScorer,
+    DeduplicationTransform,
+    ComplianceFilterTransform,
+    CurationPipeline,
 )
 
 from raise_.transforms.inference import (
@@ -208,6 +216,7 @@ __all__ = [
     # Client
     "TransformsClient",
     # Multimodal
+    "TimeRange",
     "BlobReference",
     "BlobRegistry",
     "BlobStatus",
@@ -223,6 +232,11 @@ __all__ = [
     "BlobReferenceType",
     "create_reference",
     "infer_content_type",
+    # Curation
+    "QualityScorer",
+    "DeduplicationTransform",
+    "ComplianceFilterTransform",
+    "CurationPipeline",
     # Inference
     "ModelFramework",
     "AcceleratorType",
