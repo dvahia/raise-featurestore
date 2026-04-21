@@ -187,6 +187,7 @@ if result.metrics["null_rate"] > 0.1:
   - [Airflow Integration](#airflow-integration)
 - [Multimodal Data](#multimodal-data)
   - [Blob References](#blob-references)
+  - [Video and Audio Clips (TimeRange)](#video-and-audio-clips-timerange)
   - [BlobRef Feature Type](#blobref-feature-type)
   - [Blob Registry](#blob-registry)
   - [Multimodal Sources](#multimodal-sources)
@@ -198,6 +199,21 @@ if result.metrics["null_rate"] > 0.1:
   - [Inference Transforms](#inference-transforms)
   - [Convenience Functions](#convenience-functions)
   - [Chained Inference](#chained-inference)
+- [Dataset Curation](#dataset-curation)
+  - [Quality Scoring](#quality-scoring)
+  - [Deduplication](#deduplication)
+  - [Compliance Filtering](#compliance-filtering)
+  - [Curation Pipeline](#curation-pipeline)
+- [Dataset Mixing and Versioning](#dataset-mixing-and-versioning)
+  - [Mix Sources](#mix-sources)
+  - [Mixing Strategies](#mixing-strategies)
+  - [Dataset Versioning](#dataset-versioning)
+  - [Provenance Tracking](#provenance-tracking)
+- [Post-Training Data](#post-training-data)
+  - [SFT Datasets](#sft-datasets)
+  - [Preference Data and DPO](#preference-data-and-dpo)
+  - [Evaluation Suites](#evaluation-suites)
+  - [Human Annotation Tasks](#human-annotation-tasks)
 - [API Reference](#api-reference)
 
 ---
@@ -1507,6 +1523,109 @@ ref = create_reference(
 | `is_audio` | True if content type is audio/* |
 | `is_video` | True if content type is video/* |
 
+### Video and Audio Clips (TimeRange)
+
+Every `BlobReference` can represent either a complete file or a **sub-clip** — a contiguous time range within a video or audio file. No data is copied; only the URI plus the time window are stored.
+
+```python
+from raise_ import TimeRange, BlobReference, BlobRegistry, ContentType
+
+registry = BlobRegistry(name="video-store")
+
+# Register the full video file
+video_ref = registry.register(
+    uri="s3://datasets/videos/lecture_001.mp4",
+    content_type=ContentType.VIDEO_MP4,
+    checksum="e3b0c44298fc1c...",
+    size_bytes=2_500_000_000,
+    metadata={"duration_sec": 3600.0, "fps": 30.0, "width": 1920, "height": 1080},
+)
+
+# Create a clip by calling .clip() — same URI, different time window
+intro_clip = video_ref.clip(start_sec=0.0, end_sec=60.0)
+interview  = video_ref.clip(start_sec=300.0, end_sec=900.0)
+
+print(intro_clip.is_clip)                  # True
+print(intro_clip.time_range)               # TimeRange(0.000s – 60.000s, 60.000s)
+print(intro_clip.time_range.duration_sec)  # 60.0
+
+# Clips share the source URI and checksum — no data is duplicated
+assert intro_clip.uri == video_ref.uri
+assert intro_clip.checksum == video_ref.checksum
+```
+
+#### TimeRange
+
+```python
+from raise_ import TimeRange
+
+tr = TimeRange(start_sec=30.0, end_sec=90.0)
+print(tr.duration_sec)   # 60.0
+print(tr.to_dict())      # {"start_sec": 30.0, "end_sec": 90.0}
+
+# Restore from dict
+tr2 = TimeRange.from_dict({"start_sec": 30.0, "end_sec": 90.0})
+```
+
+#### Clip Properties
+
+| Property | Description |
+|----------|-------------|
+| `is_clip` | True if the reference has a `time_range` |
+| `time_range` | `TimeRange` (start/end in seconds) or None |
+| `duration_sec` | Duration of clip (or full-file duration from metadata) |
+
+#### Extracting Fixed-Length Clips
+
+```python
+def extract_clips(video_ref, video_id, clip_sec=10.0, stride_sec=5.0):
+    total = video_ref.metadata["duration_sec"]
+    clips, t, i = [], 0.0, 0
+    while t + clip_sec <= total:
+        clip = video_ref.clip(start_sec=t, end_sec=t + clip_sec)
+        clips.append({"clip_id": f"{video_id}_{i:05d}", "clip_ref": clip.to_dict(),
+                      "start_sec": t, "end_sec": t + clip_sec})
+        t += stride_sec
+        i += 1
+    return clips
+
+clips = extract_clips(video_ref, "lecture_001", clip_sec=30.0, stride_sec=15.0)
+print(f"{len(clips)} clips, 50% overlap")
+```
+
+#### Audio Segments
+
+The same API applies to audio files. Diarization output maps naturally to clips:
+
+```python
+registry = BlobRegistry(name="audio-store")
+audio_ref = registry.register(
+    uri="s3://audio/interview.wav",
+    content_type=ContentType.AUDIO_WAV,
+    checksum="abc123...",
+    metadata={"duration_sec": 3600.0, "sample_rate_hz": 44100},
+)
+
+# Diarization: one clip per speaker turn
+for turn in diarization_output:
+    segment = audio_ref.clip(start_sec=turn["start"], end_sec=turn["end"])
+    segment = segment.with_metadata(speaker=turn["speaker"])
+    print(f"  {segment.time_range}  speaker={segment.metadata['speaker']}")
+```
+
+#### Serialization
+
+Clips serialize and deserialize correctly:
+
+```python
+d = clip.to_dict()          # {"uri": ..., "time_range": {"start_sec": ..., "end_sec": ...}, ...}
+restored = BlobReference.from_dict(d)
+assert restored.is_clip
+assert restored.time_range.start_sec == clip.time_range.start_sec
+```
+
+---
+
 ### BlobRef Feature Type
 
 Use `BlobRef` to define feature columns that store blob references.
@@ -2152,6 +2271,605 @@ fs.deploy_job(image_job)
 
 ---
 
+## Dataset Curation
+
+Raise provides first-class curation transforms for building high-quality training datasets: quality scoring, near-deduplication, and compliance filtering. Each step is a `Transform` that runs in a `Job` and writes annotation columns back into the feature group alongside the original data.
+
+### Quality Scoring
+
+`QualityScorer` computes per-dimension quality scores and an optional composite score. Records that fail threshold checks can be filtered automatically.
+
+```python
+from raise_ import (
+    QualityScorer, QualityDimension, QualityThreshold,
+    FeatureStore, Schedule, Target, FeatureGroupSource,
+)
+
+scorer = QualityScorer(
+    name="web_quality",
+    dimensions=[
+        QualityDimension.FLUENCY,
+        QualityDimension.COHERENCE,
+        QualityDimension.FORMAT,
+    ],
+    thresholds=[
+        QualityThreshold(QualityDimension.FLUENCY,   min_score=0.5),
+        QualityThreshold(QualityDimension.COHERENCE, min_score=0.4),
+    ],
+    model_uri="hf://acme/web-quality-scorer-v2",
+    input_columns=["text"],
+    composite_column="quality_score",
+    filter_below_threshold=True,
+)
+
+# Output columns written per run
+print(scorer.output_columns)
+# ["quality_score", "quality_fluency", "quality_coherence", "quality_format"]
+```
+
+#### Quality Dimensions
+
+| Dimension | Description |
+|-----------|-------------|
+| `FLUENCY` | Grammatical and linguistic quality |
+| `COHERENCE` | Logical coherence and consistency |
+| `FACTUALITY` | Factual accuracy and grounding |
+| `SAFETY` | Absence of harmful content |
+| `RELEVANCE` | Relevance to a target domain or task |
+| `COMPLETENESS` | Completeness of information |
+| `FORMAT` | Structural correctness (JSON, code, etc.) |
+| `DIVERSITY` | Lexical and semantic diversity |
+
+### Deduplication
+
+`DeduplicationTransform` detects near-duplicate records and writes an `is_duplicate` flag and a `duplicate_of` FK.
+
+```python
+from raise_ import (
+    DeduplicationTransform, DeduplicationConfig, DeduplicationAlgorithm,
+)
+
+dedup = DeduplicationTransform(
+    name="web_minhash_dedup",
+    config=DeduplicationConfig(
+        algorithm=DeduplicationAlgorithm.MINHASH,
+        threshold=0.85,           # 85% similarity → duplicate
+        key_columns=["text"],
+        num_perm=256,             # accuracy of MinHash estimation
+        action="flag",            # "flag" or "remove"
+        keep="first",
+    ),
+)
+
+# Embedding-based dedup (for multimodal or semantic similarity)
+emb_dedup = DeduplicationTransform(
+    name="semantic_dedup",
+    config=DeduplicationConfig(
+        algorithm=DeduplicationAlgorithm.EMBEDDING_SIMILARITY,
+        threshold=0.95,
+        embedding_column="text_embedding",
+        action="remove",
+        keep="highest_quality",
+        quality_column="quality_score",
+    ),
+)
+```
+
+#### Deduplication Algorithms
+
+| Algorithm | Description |
+|-----------|-------------|
+| `EXACT_HASH` | Exact byte-level match |
+| `MINHASH` | Locality-sensitive hashing for text |
+| `SIMHASH` | Bit-level similarity hashing |
+| `EMBEDDING_SIMILARITY` | Cosine distance on pre-computed vectors |
+| `BLOOM_FILTER` | Probabilistic membership test |
+
+### Compliance Filtering
+
+`ComplianceFilterTransform` applies a `CompliancePolicy` — a set of classifier-backed rules that detect PII, NSFW content, copyright, toxicity, and other compliance concerns.
+
+```python
+from raise_ import (
+    ComplianceFilterTransform, CompliancePolicy, ComplianceRule,
+    ComplianceFlag, ComplianceAction,
+)
+
+policy = CompliancePolicy(name="pretraining-standard")
+policy.add_rule(ComplianceFlag.NSFW,      threshold=0.7)
+policy.add_rule(ComplianceFlag.COPYRIGHT, action=ComplianceAction.FLAG, threshold=0.85)
+policy.add_rule(ComplianceFlag.PII,       action=ComplianceAction.REDACT, threshold=0.6)
+policy.add_rule(ComplianceFlag.CHILD_SAFETY, threshold=0.3)   # strict
+
+compliance = ComplianceFilterTransform(
+    name="pretraining_compliance",
+    policy=policy,
+    input_columns=["text", "url"],
+    passed_column="compliance_passed",
+)
+
+print(compliance.output_columns)
+# ["compliance_passed", "compliance_nsfw", "compliance_copyright",
+#  "compliance_pii", "compliance_child_safety"]
+```
+
+#### Compliance Flags and Actions
+
+| Flag | Description |
+|------|-------------|
+| `PII` | Personally identifiable information |
+| `NSFW` | Not safe for work content |
+| `COPYRIGHT` | Potentially copyrighted material |
+| `HATE_SPEECH` | Hate speech or harassment |
+| `TOXIC` | General toxicity |
+| `MEDICAL` | Sensitive medical information |
+| `LEGAL` | Legal privilege or sensitive legal content |
+| `CHILD_SAFETY` | CSAM or related |
+
+| Action | Description |
+|--------|-------------|
+| `FILTER` | Remove the record (default) |
+| `FLAG` | Keep but write annotation columns |
+| `REDACT` | Attempt in-place redaction (e.g., PII masking) |
+
+### Curation Pipeline
+
+Compose curation steps into a named, ordered pipeline.
+
+```python
+from raise_ import CurationPipeline
+
+pipeline = CurationPipeline(
+    name="pretraining-curation",
+    steps=[scorer, dedup, compliance],
+    stop_on_first_filter=False,  # collect all annotations before filtering
+)
+
+print(pipeline.all_output_columns)
+# All columns written by all steps
+
+# Inspect individual steps
+pipeline.quality_scorer()   # → QualityScorer
+pipeline.deduplication()    # → DeduplicationTransform
+pipeline.compliance()       # → ComplianceFilterTransform
+
+# Run as a Job
+job = fs.create_job(
+    name="web_curation",
+    sources=[FeatureGroupSource(feature_group="raw-documents", features=["doc_id", "text"])],
+    transform=pipeline.steps[0],
+    target=Target(feature_group="curated-documents", write_mode="upsert", key_columns=["doc_id"]),
+    schedule=Schedule.daily(hour=2),
+)
+```
+
+---
+
+## Dataset Mixing and Versioning
+
+Pre-training datasets are assembled from multiple curated sources using controlled mixing strategies. Raise tracks the full configuration, weights, and provenance so that mixes are reproducible and auditable.
+
+### Mix Sources
+
+```python
+from raise_ import MixSource
+
+web_source = MixSource(
+    feature_group="acme/pretraining/web/curated-documents",
+    weight=0.70,
+    filters=["include_in_training == True", "language == 'en'"],
+)
+
+books_source = MixSource(
+    feature_group="acme/pretraining/books/curated-documents",
+    weight=0.15,
+    filters=["include_in_training == True"],
+)
+
+code_source = MixSource(
+    feature_group="acme/pretraining/code/curated-documents",
+    weight=0.15,
+)
+```
+
+### Mixing Strategies
+
+```python
+from raise_ import DatasetMix, MixingStrategy
+
+# Standard weighted mix
+weighted = DatasetMix(
+    name="pretraining-v3",
+    sources=[web_source, books_source, code_source],
+    strategy=MixingStrategy.WEIGHTED,
+    total_samples=2_000_000_000,
+)
+print(weighted.effective_weights())   # [0.70, 0.15, 0.15]
+
+# Temperature mixing — cools high-weight sources, warms low-weight ones
+temperature = DatasetMix(
+    name="pretraining-v3-temp",
+    sources=[web_source, books_source, code_source],
+    strategy=MixingStrategy.TEMPERATURE,
+    temperature=0.7,    # < 1 amplifies dominant source; > 1 flattens toward uniform
+    total_samples=2_000_000_000,
+)
+
+# Uniform — ignores weights; useful for ablation studies
+uniform = DatasetMix(
+    name="ablation-uniform",
+    sources=[web_source, books_source, code_source],
+    strategy=MixingStrategy.UNIFORM,
+    total_samples=100_000_000,
+)
+```
+
+| Strategy | Description |
+|----------|-------------|
+| `WEIGHTED` | Sample proportional to declared weights |
+| `TEMPERATURE` | Apply temperature scaling before normalization |
+| `UNIFORM` | Equal probability regardless of weight |
+| `PROPORTIONAL` | Proportional to source dataset size |
+| `ROUND_ROBIN` | Strict interleaving |
+
+### Dataset Versioning
+
+```python
+from raise_ import DatasetVersion
+
+v1 = DatasetVersion(
+    name="foundation-pretraining",
+    version="v1.0.0",
+    feature_group="acme/pretraining/foundation/training-mix",
+    num_records=500_000_000,
+    size_bytes=2_000 * 1024**3,
+    applied_filters=["quality_score >= 0.5"],
+)
+
+# Derive v2 from v1 — parent lineage is preserved
+v2 = v1.derive(
+    version="v2.0.0",
+    applied_filters=["quality_score >= 0.65", "is_duplicate == False", "compliance_passed == True"],
+    num_records=380_000_000,
+    size_bytes=1_520 * 1024**3,
+)
+
+print(v2.parent_version)   # "v1.0.0"
+print(v2.is_initial)       # False
+print(v2.size_gb)          # 1520.0
+```
+
+### Provenance Tracking
+
+```python
+from raise_ import DatasetProvenance
+from datetime import datetime
+
+provenance = DatasetProvenance(
+    source_name="CommonCrawl-2024-Q1",
+    source_uri="s3://commoncrawl/crawl-data/CC-MAIN-2024-10/",
+    collection_date=datetime(2024, 3, 1),
+    license="CC0",
+    language_codes=["en", "zh", "es", "fr", "de"],
+    domain_tags=["web", "news", "blog"],
+    pii_reviewed=True,
+    consent_documented=False,
+)
+
+# Attach to a dataset version
+v3 = DatasetVersion(
+    name="foundation-pretraining",
+    version="v3.0.0",
+    feature_group="acme/pretraining/foundation/training-mix",
+    num_records=2_000_000_000,
+    size_bytes=8_000 * 1024**3,
+    provenance=provenance,
+)
+```
+
+---
+
+## Post-Training Data
+
+Raise supports the full post-training data lifecycle: collecting SFT examples, gathering human preferences, preparing DPO triplets, training reward models, running evaluations, and managing human annotation workflows.
+
+### SFT Datasets
+
+SFT data lives in ordinary feature groups with schemas designed for instruction-response pairs and multi-turn conversations.
+
+```python
+from raise_ import FeatureStore, BlobRef, Array
+
+fs = FeatureStore("acme/posttraining/sft")
+
+# Single-turn instruction-response pairs
+ir_pairs = fs.create_feature_group("instruction-response-pairs", entity_key="example_id")
+ir_pairs.create_features_from_schema({
+    "example_id": "string",
+    "system_prompt": "string",
+    "instruction": "string",
+    "response": "string",
+    "source": "string",
+    "quality_score": "float64",
+    "include_in_training": "bool",
+})
+
+# Multi-turn conversations (turns serialized as JSON)
+conversations = fs.create_feature_group("conversations", entity_key="conversation_id")
+conversations.create_features_from_schema({
+    "conversation_id": "string",
+    "system_prompt": "string",
+    "turns_json": "string",     # list of {"role": ..., "content": ...}
+    "num_turns": "int64",
+    "total_tokens": "int64",
+    "quality_score": "float64",
+    "include_in_training": "bool",
+})
+
+# Multimodal SFT — single image
+image_sft = fs.create_feature_group("image-instruction-pairs", entity_key="example_id")
+image_sft.create_features_from_schema({
+    "example_id": "string",
+    "image_ref": BlobRef(content_types=["image/jpeg", "image/png", "image/webp"]),
+    "instruction": "string",
+    "response": "string",
+    "task_type": "string",    # "vqa" | "captioning" | "ocr" | "grounding"
+    "quality_score": "float64",
+    "include_in_training": "bool",
+})
+
+# Multi-image interleaved SFT
+multi_image = fs.create_feature_group("multi-image-conversations", entity_key="conversation_id")
+multi_image.create_features_from_schema({
+    "conversation_id": "string",
+    # Ordered list of image refs matching <image_N> placeholders in turns_json
+    "image_refs": Array(BlobRef(content_types=["image/jpeg", "image/png"])),
+    "num_images": "int64",
+    "turns_json": "string",
+    "total_tokens": "int64",
+    "include_in_training": "bool",
+})
+```
+
+#### SFT Dataset Versioning and Mixing
+
+```python
+from raise_ import DatasetVersion, DatasetMix, MixSource, MixingStrategy
+
+sft_v2 = DatasetVersion(
+    name="acme-sft-v2",
+    version="sft-v2.0",
+    feature_group="acme/posttraining/sft/conversations",
+    num_records=1_200_000,
+    metadata={"modalities": ["text", "image"]},
+)
+
+sft_mix = DatasetMix(
+    name="sft-v2-mix",
+    sources=[
+        MixSource("acme/posttraining/sft/conversations",             weight=0.50),
+        MixSource("acme/posttraining/sft/image-instruction-pairs",   weight=0.30),
+        MixSource("acme/posttraining/sft/video-instruction-pairs",   weight=0.10),
+        MixSource("acme/posttraining/sft/multi-image-conversations", weight=0.10),
+    ],
+    strategy=MixingStrategy.WEIGHTED,
+    total_samples=1_200_000,
+)
+```
+
+### Preference Data and DPO
+
+Preference pairs, DPO triplets, and reward model training data are all stored as feature groups.
+
+```python
+# Preference pairs
+preference_pairs = fs.create_feature_group("preference-pairs", entity_key="pair_id")
+preference_pairs.create_features_from_schema({
+    "pair_id": "string",
+    "prompt": "string",
+    "response_a": "string",
+    "response_b": "string",
+    "preferred": "string",         # "response_a" | "response_b" | "tie"
+    "preference_confidence": "float64",
+    "annotator_agreement": "float64",
+    "is_gold": "bool",             # high-agreement, high-confidence pairs
+    "include_in_training": "bool",
+})
+
+# DPO triplets (derived from preference pairs)
+dpo_triplets = fs.create_feature_group("dpo-triplets", entity_key="triplet_id")
+dpo_triplets.create_features_from_schema({
+    "triplet_id": "string",
+    "prompt": "string",
+    "chosen": "string",
+    "rejected": "string",
+    # Pre-computed from the reference model (avoids overhead during DPO training loop)
+    "chosen_ref_logprob": "float64",
+    "rejected_ref_logprob": "float64",
+    "preference_margin": "float64",
+    "include_in_training": "bool",
+})
+
+# Reward model training data
+reward_data = fs.create_feature_group("reward-training-data", entity_key="example_id")
+reward_data.create_features_from_schema({
+    "example_id": "string",
+    "prompt": "string",
+    "response": "string",
+    "reward_score": "float64",     # normalized scalar in [0, 1]
+    "bt_score": "float64",         # Bradley-Terry win probability
+    "elo_score": "float64",
+    "num_ratings": "int64",
+    "include_in_training": "bool",
+})
+```
+
+### Evaluation Suites
+
+`EvalSuite` is a versioned collection of evaluation examples that serves as a stable benchmark across model iterations.
+
+```python
+from raise_ import EvalSuite, EvalExample, EvalMetric, BlobReference
+
+suite = EvalSuite(
+    name="instruction-following-v1",
+    description="Tests model ability to follow detailed instructions",
+    version="v1.0",
+    metrics=[EvalMetric.ACCURACY, EvalMetric.WIN_RATE, EvalMetric.MEAN_OPINION_SCORE],
+    tags=["instruction-following"],
+)
+
+# Text example
+suite.add_example(EvalExample(
+    example_id="if_001",
+    input={"prompt": "Write a haiku about machine learning."},
+    ground_truth=None,     # no single correct answer — human judgment required
+    difficulty="easy",
+    domain="creative-writing",
+))
+
+# Multimodal example
+suite.add_example(EvalExample(
+    example_id="vr_001",
+    input={"image_ref": image_ref.to_dict(), "prompt": "How many objects are visible?"},
+    ground_truth={"answer": "7"},
+    difficulty="medium",
+    domain="visual-counting",
+))
+
+# Video clip example
+suite.add_example(EvalExample(
+    example_id="vr_002",
+    input={"video_ref": clip_ref.to_dict(), "prompt": "What action occurs between 5s and 15s?"},
+    ground_truth=None,
+    difficulty="hard",
+    domain="temporal-reasoning",
+))
+
+# Sampling and filtering
+quick_suite = suite.sample(n=50, seed=42)
+chart_suite = suite.filter_by_domain("visual-counting")
+
+print(len(suite))         # total examples
+print(quick_suite)        # EvalSuite('instruction-following-v1'@v1.0, 50 examples)
+```
+
+#### EvalResult
+
+```python
+from raise_ import EvalResult
+
+result = EvalResult(
+    suite_name="instruction-following-v1",
+    suite_version="v1.0",
+    model_id="acme-claude-v2",
+    scores={
+        "accuracy": 0.823,
+        "win_rate": 0.614,
+        "mean_opinion_score": 3.87,
+    },
+    num_evaluated=200,
+    human_win_rate=0.614,
+)
+
+print(result.success_rate)   # 1.0 (or less if there were failures)
+```
+
+### Human Annotation Tasks
+
+`HumanEvalTask` defines what human annotators (or LLM judges) evaluate and how results are collected back into the feature store.
+
+```python
+from raise_ import (
+    HumanEvalTask, AnnotationTaskType, AnnotatorConfig,
+    AnnotatorPoolType, AgreementMetric,
+    AnnotationResult, AnnotationBatch,
+)
+
+# Human preference collection
+pref_task = HumanEvalTask(
+    name="response-quality-preference",
+    task_type=AnnotationTaskType.BINARY_PREFERENCE,
+    instructions="Select the more helpful and harmless response.",
+    source_feature_group="acme/posttraining/rlhf/preference-pairs",
+    source_columns=["prompt", "response_a", "response_b"],
+    label_column="preferred",
+    options=["response_a", "response_b", "tie"],
+    min_annotations=5,
+    annotator_config=AnnotatorConfig(
+        pool_type=AnnotatorPoolType.INTERNAL,
+        min_annotations_per_item=5,
+        annotator_qualifications=["passed-safety-training"],
+    ),
+    agreement_metric=AgreementMetric.FLEISS_KAPPA,
+    consensus_strategy="majority",
+)
+
+# LLM-as-judge (high-throughput bootstrap)
+llm_judge = HumanEvalTask(
+    name="llm-judge-preference",
+    task_type=AnnotationTaskType.BINARY_PREFERENCE,
+    instructions="(LLM judge)",
+    source_feature_group="acme/posttraining/rlhf/preference-pairs",
+    source_columns=["prompt", "response_a", "response_b"],
+    label_column="preferred",
+    options=["response_a", "response_b", "tie"],
+    min_annotations=1,
+    annotator_config=AnnotatorConfig(
+        pool_type=AnnotatorPoolType.MODEL,
+        model_judge_uri="hf://acme/preference-judge-v2",
+        model_judge_prompt_template=(
+            "Prompt: {prompt}\n\nA: {response_a}\n\nB: {response_b}\n\n"
+            "Which is better? Reply A, B, or TIE."
+        ),
+    ),
+)
+
+# Dispatching batches
+batch = AnnotationBatch(
+    batch_id="pref_batch_001",
+    task_name="response-quality-preference",
+    item_ids=[f"pair_{i:06d}" for i in range(500)],
+    status="in_progress",
+)
+print(batch.total_items)       # 500
+print(batch.completion_rate)   # 0.0 (not yet completed)
+
+# Collecting results
+result = AnnotationResult(
+    task_name="response-quality-preference",
+    item_id="pair_000001",
+    annotator_id="evaluator_01",
+    label="response_b",
+    confidence=0.85,
+    duration_sec=45.0,
+)
+```
+
+#### Annotation Task Types
+
+| Task Type | Description |
+|-----------|-------------|
+| `BINARY_PREFERENCE` | A vs B, pick one (RLHF pairwise) |
+| `RATING` | Numeric score on a scale |
+| `LIKERT` | Ordered categorical (e.g., 1–5) |
+| `RANKING` | Order a list of candidates |
+| `BINARY_LABEL` | Yes/No for a single item |
+| `MULTI_LABEL` | Select all that apply |
+| `OPEN_ENDED` | Free-text annotation |
+
+#### Annotator Pool Types
+
+| Pool Type | Description |
+|-----------|-------------|
+| `INTERNAL` | Internal ML team |
+| `CROWD` | Crowdsourcing (MTurk, etc.) |
+| `EXPERT` | Domain experts |
+| `MODEL` | LLM-as-judge |
+| `HYBRID` | LLM pre-screen + human review |
+
+---
+
 ## API Reference
 
 ### FeatureStore
@@ -2285,6 +3003,15 @@ See the `examples/` directory for complete working examples:
 7. **07_transformations.py** - ETL jobs, SQL/Python transforms, scheduling, Airflow integration
 8. **08_multimodal.py** - Blob references, registries, integrity validation, multimodal sources
 9. **09_bulk_inference.py** - Inference transforms, GPU/TPU configuration, model specifications
+10. **10_video_clips.py** - Video BlobReferences, TimeRange sub-clips, clip serialization
+11. **11_audio_features.py** - Audio segments, diarization-driven splits, sliding-window pre-training
+12. **12_dataset_curation.py** - QualityScorer, deduplication, compliance filtering, CurationPipeline
+13. **13_dataset_mixing.py** - Weighted/temperature mixing, DatasetVersion lineage, DatasetProvenance
+14. **14_sft_datasets.py** - SFT schemas for text, single-image, multi-image, and video instruction-following
+15. **15_preference_data.py** - Preference pairs, DPO triplets, reward model training data, LLM-as-judge
+16. **16_evals_and_human_feedback.py** - EvalSuites, human annotation tasks, inter-annotator agreement
+17. **17_pretraining_pipeline.py** - End-to-end pre-training pipeline: ingestion → curation → mixing → versioning
+18. **18_posttraining_pipeline.py** - End-to-end post-training pipeline: SFT → RLHF → DPO → eval gating
 
 ---
 

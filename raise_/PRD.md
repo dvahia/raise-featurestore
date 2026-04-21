@@ -1,9 +1,10 @@
 # Raise Feature Store - Product Requirements Document
 
-**Version:** 1.3
+**Version:** 1.4
 **Status:** Ready for Engineering Review
-**Last Updated:** 2026-02-21
+**Last Updated:** 2026-04-20
 
+> **v1.4 Changes:** Added Dataset Curation (Section 19), Dataset Mixing and Versioning (Section 20), Post-Training Data Management (Section 21)
 > **v1.3 Changes:** Added Bulk Inference Support (Section 18)
 > **v1.2 Changes:** Added Multimodal Data Support (Section 17)
 > **v1.1 Changes:** Added ETL/Transformations (Section 15) and Airflow Integration (Section 16)
@@ -38,11 +39,14 @@ This PRD defines the backend systems and middleware required to support the Rais
 16. [Airflow Integration](#16-airflow-integration)
 17. [Multimodal Data Support](#17-multimodal-data-support)
 18. [Bulk Inference Support](#18-bulk-inference-support)
-19. [Storage Requirements](#19-storage-requirements)
-20. [API Layer](#20-api-layer)
-21. [Non-Functional Requirements](#21-non-functional-requirements)
-22. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
-23. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
+19. [Dataset Curation and Quality](#19-dataset-curation-and-quality)
+20. [Dataset Mixing and Versioning](#20-dataset-mixing-and-versioning)
+21. [Post-Training Data Management](#21-post-training-data-management)
+22. [Storage Requirements](#22-storage-requirements)
+23. [API Layer](#23-api-layer)
+24. [Non-Functional Requirements](#24-non-functional-requirements)
+25. [Appendix: Data Type Specifications](#appendix-a-data-type-specifications)
+26. [Appendix: SQL Function Support](#appendix-b-sql-function-support)
 
 ---
 
@@ -61,6 +65,9 @@ This PRD defines the backend systems and middleware required to support the Rais
 9. **ETL/Transformations**: Support data transformation pipelines with SQL and Python, integrated with Airflow
 10. **Incremental Processing**: Checkpoint-based incremental updates with support for late-arriving data
 11. **Feature Serving**: Point lookups by entity key for inference-time feature retrieval
+12. **Dataset Curation**: Integrated quality scoring, near-deduplication, and compliance filtering as first-class pipeline stages
+13. **Dataset Mixing and Versioning**: Multi-source mixing strategies with immutable dataset snapshots and full provenance
+14. **Post-Training Data Management**: Native support for SFT datasets, RLHF preference pairs, DPO triplets, reward model training data, eval suites, and human annotation workflows
 
 ### Non-Goals (v1)
 
@@ -104,10 +111,14 @@ This PRD defines the backend systems and middleware required to support the Rais
 │  │   ACL         │  │   Audit       │  │   Dashboard   │               │
 │  │   Service     │  │   Service     │  │   Service     │               │
 │  └───────────────┘  └───────────────┘  └───────────────┘               │
-│  ┌───────────────┐  ┌───────────────┐                                   │
-│  │   Alert       │  │   Live Table  │                                   │
-│  │   Service     │  │   Service     │                                   │
-│  └───────────────┘  └───────────────┘                                   │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐               │
+│  │   Alert       │  │   Live Table  │  │   Curation    │               │
+│  │   Service     │  │   Service     │  │   Service     │               │
+│  └───────────────┘  └───────────────┘  └───────────────┘               │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐               │
+│  │   Dataset     │  │   Annotation  │  │   Eval        │               │
+│  │   Registry    │  │   Service     │  │   Service     │               │
+│  └───────────────┘  └───────────────┘  └───────────────┘               │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -152,6 +163,10 @@ This PRD defines the backend systems and middleware required to support the Rais
 | **Dashboard Service** | Store dashboard definitions, render specs |
 | **Alert Service** | Evaluate conditions, trigger notifications |
 | **Live Table Service** | Manage CDC subscriptions, refresh materialized views |
+| **Curation Service** | Orchestrate quality scoring, deduplication, and compliance pipelines |
+| **Dataset Registry** | Manage dataset versions, provenance, mixing configs, and lineage |
+| **Annotation Service** | Dispatch annotation tasks, aggregate results, compute agreement |
+| **Eval Service** | Manage eval suites, record model results, compute metrics |
 | **Query Engine** | Execute SQL against feature data |
 | **Expression Evaluator** | Validate and compile derived feature expressions |
 | **Analytics Engine** | Compute aggregations, distributions, correlations, statistical tests |
@@ -2482,9 +2497,529 @@ spec:
 
 ---
 
-## 19. Storage Requirements
+## 19. Dataset Curation and Quality
 
-### 19.1 Metadata Store
+### 19.1 Overview
+
+The Curation Service provides a composable, auditable pipeline for transforming raw ingestion data into high-quality training-ready datasets. Curation is modeled as an ordered sequence of `Transform` steps registered as `CurationPipeline` objects, and executed as standard `Job`s so that scheduling, incremental processing, and lineage tracking are inherited automatically.
+
+### 19.2 Quality Scoring
+
+**Purpose:** Score each document/sample on one or more quality dimensions and write scalar output columns alongside the source record.
+
+**Quality Dimensions:**
+
+| Dimension | Description |
+|-----------|-------------|
+| `FLUENCY` | Grammatical and syntactic coherence of text |
+| `COHERENCE` | Logical flow and topical consistency |
+| `FORMAT` | Structural quality (headers, lists, code blocks) |
+| `SAFETY` | Absence of harmful, toxic, or offensive content |
+| `RELEVANCE` | Relevance of a caption/alt-text to its paired image |
+| `COMPLETENESS` | Adequacy of the response or description |
+
+**QualityScorer Transform:**
+
+```python
+QualityScorer(
+    name="text_quality",
+    dimensions=[QualityDimension.FLUENCY, QualityDimension.COHERENCE],
+    thresholds=[
+        QualityThreshold(QualityDimension.FLUENCY,   min_score=0.5),
+        QualityThreshold(QualityDimension.COHERENCE, min_score=0.4),
+    ],
+    model_uri="hf://org/quality-scorer-v3",
+    input_columns=["text"],
+)
+```
+
+**Output columns:** `quality_score` (composite), `quality_{dimension}` for each scored dimension.
+
+**Backend Requirements:**
+
+- Execute scorer models (HuggingFace URIs or internal model registry) as distributed batch inference
+- GPU-accelerated batch inference, same runtime as `InferenceTransform`
+- Write output columns via upsert to the target feature group
+- Support incremental execution via timestamp watermark
+
+### 19.3 Near-Deduplication
+
+**Purpose:** Identify and flag near-duplicate records within a corpus, then write `is_duplicate` and `duplicate_of` columns.
+
+**Algorithms:**
+
+| Algorithm | Use Case | Complexity |
+|-----------|----------|------------|
+| `MINHASH` | Text near-dedup (Jaccard similarity) | O(N log N) |
+| `SIMHASH` | Text near-dedup (Hamming distance) | O(N) |
+| `EMBEDDING_SIMILARITY` | Semantic dedup via embedding cosine sim | O(N²) or ANN |
+| `EXACT_HASH` | Exact dedup via hash comparison | O(N) |
+
+**DeduplicationConfig:**
+
+```python
+DeduplicationConfig(
+    algorithm=DeduplicationAlgorithm.MINHASH,
+    threshold=0.80,          # Jaccard similarity threshold
+    key_columns=["text"],    # columns used for fingerprinting
+    num_perm=256,            # MinHash permutations
+    action="flag",           # "flag" writes is_duplicate; "remove" filters
+)
+```
+
+**Backend Requirements:**
+
+- MinHash: Spark/Dask distributed LSH with configurable band/row parameters
+- Embedding similarity: FAISS or ScaNN ANN index for large corpora
+- Cross-partition deduplication: global union-find for cluster assignment
+- Output: `is_duplicate: bool`, `duplicate_of: string | null`, `duplicate_cluster_id: string`
+
+### 19.4 Compliance Filtering
+
+**Purpose:** Classify and act on content violating safety, privacy, or copyright policies.
+
+**Compliance Flags:**
+
+| Flag | Description | Default Action |
+|------|-------------|----------------|
+| `NSFW` | Not-safe-for-work content | `FILTER` |
+| `HATE_SPEECH` | Hateful or discriminatory content | `FILTER` |
+| `PII` | Personally identifiable information | `REDACT` |
+| `COPYRIGHT` | Likely copyrighted material | `FLAG` |
+| `CHILD_SAFETY` | CSAM or child exploitation material | `FILTER` |
+
+**Compliance Actions:**
+
+| Action | Behavior |
+|--------|----------|
+| `FILTER` | Exclude record from training (`compliance_passed = False`) |
+| `FLAG` | Mark for human review; do not exclude automatically |
+| `REDACT` | Replace PII spans with `[REDACTED]` tokens in-place |
+
+**CompliancePolicy:**
+
+```python
+policy = CompliancePolicy(name="pretraining-v4")
+policy.add_rule(ComplianceFlag.NSFW,         threshold=0.6)
+policy.add_rule(ComplianceFlag.PII,          action=ComplianceAction.REDACT, threshold=0.6)
+policy.add_rule(ComplianceFlag.COPYRIGHT,    action=ComplianceAction.FLAG,   threshold=0.85)
+policy.add_rule(ComplianceFlag.CHILD_SAFETY, threshold=0.3)   # strict
+```
+
+**Output columns:** `compliance_passed: bool`, `compliance_{flag}: float64` score per rule, `compliance_redacted_text: string` (when REDACT applied).
+
+### 19.5 CurationPipeline
+
+**Purpose:** Composable ordered sequence of curation transforms. Each step's output is consumed by the next.
+
+```python
+CurationPipeline(
+    name="text-curation-v4",
+    steps=[quality_scorer, dedup_transform, compliance_filter],
+)
+```
+
+**Properties:**
+- `all_output_columns` — union of output columns from all steps
+- `add_step(transform)` — append a step; returns `self` for chaining
+- `quality_scorer()`, `deduplication()`, `compliance()` — accessors by type
+
+**Backend Requirements:**
+
+- Pipeline steps execute as chained Jobs; the orchestrator wires source → sink between steps
+- Each step writes its output columns to the same target feature group (upsert semantics)
+- Pipeline-level lineage recorded: raw FG → curated FG with all transform names
+- Steps can be parallelized when there are no dependencies between them (e.g., quality scoring and initial compliance scan)
+
+### 19.6 Disposition Step
+
+After curation, a SQL disposition step computes the final `include_in_training` boolean:
+
+```sql
+UPDATE curated_text
+SET include_in_training = (
+    quality_score >= 0.5
+    AND is_duplicate = False
+    AND compliance_passed = True
+)
+```
+
+This step is a standard `SQLTransform` Job and inherits all Job scheduling and lineage capabilities.
+
+---
+
+## 20. Dataset Mixing and Versioning
+
+### 20.1 Overview
+
+The Dataset Registry manages multi-source dataset compositions (`DatasetMix`) and immutable versioned snapshots (`DatasetVersion`). These objects are first-class metadata entities stored in the metadata store, enabling reproducible training runs and full provenance tracking from raw source to training checkpoint.
+
+### 20.2 MixSource
+
+A `MixSource` specifies one feature group that contributes samples to a mix, along with its relative weight and any row-level filters:
+
+```python
+MixSource(
+    feature_group="acme/pretraining/curated-text",
+    weight=0.60,
+    filters=["include_in_training == True", "language == 'en'"],
+)
+```
+
+### 20.3 DatasetMix
+
+Describes a full sampling configuration across multiple sources:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | str | Unique mix name |
+| `sources` | list[MixSource] | Contributing sources with weights |
+| `strategy` | MixingStrategy | How weights are interpreted |
+| `temperature` | float | Temperature for TEMPERATURE strategy |
+| `total_samples` | int | Target sample count |
+
+**Mixing Strategies:**
+
+| Strategy | Behavior |
+|----------|----------|
+| `WEIGHTED` | Sample exactly proportional to declared weights |
+| `TEMPERATURE` | Apply temperature scaling: `p_i ∝ w_i^(1/T)`. T < 1 amplifies dominant source; T > 1 smooths toward uniform |
+| `UNIFORM` | Equal probability regardless of declared weights |
+| `PROPORTIONAL` | Weight by actual dataset size (no upsampling) |
+
+**`effective_weights()`** returns the actual sampling probabilities after strategy and temperature are applied.
+
+### 20.4 DatasetVersion
+
+An immutable snapshot of a feature group at a point in time, with full provenance:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | str | Dataset name |
+| `version` | str | Semver string |
+| `feature_group` | str | Fully-qualified feature group path |
+| `num_records` | int | Record count at snapshot time |
+| `size_bytes` | int | Serialized size |
+| `applied_filters` | list[str] | Row filters applied at snapshot |
+| `provenance` | DatasetProvenance | Source attribution |
+| `parent_version` | str \| None | Previous version (for lineage chain) |
+| `tags` | list[str] | Searchable tags |
+| `metadata` | dict | Arbitrary key-value metadata |
+
+**`derive()`** creates a child version inheriting all fields except those explicitly overridden, and sets `parent_version` automatically.
+
+**Backend Requirements:**
+
+- Dataset versions are write-once records in the metadata store; no mutation after creation
+- `derive()` records parent-child lineage as an edge in the lineage graph
+- Version snapshots reference the underlying feature group's storage checkpoint (Iceberg/Delta snapshot ID)
+- Dataset versions are queryable by name, version, tags, and date range
+- Size and record counts are written at snapshot time and never recomputed (immutable)
+
+### 20.5 DatasetProvenance
+
+Captures source attribution required for licensing, compliance, and audit:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source_name` | str | Human-readable source name |
+| `source_uri` | str | Canonical URI (S3 path, URL, etc.) |
+| `collection_date` | datetime | When the data was collected |
+| `license` | str | SPDX identifier or custom string |
+| `language_codes` | list[str] | BCP-47 language codes |
+| `domain_tags` | list[str] | Content domain tags |
+| `pii_reviewed` | bool | Whether PII review was completed |
+| `metadata` | dict | Arbitrary provenance metadata |
+
+### 20.6 Storage Schema
+
+```sql
+-- Dataset versions (write-once)
+CREATE TABLE dataset_versions (
+    id            UUID PRIMARY KEY,
+    name          VARCHAR NOT NULL,
+    version       VARCHAR NOT NULL,
+    feature_group VARCHAR NOT NULL,
+    num_records   BIGINT,
+    size_bytes    BIGINT,
+    filters       JSONB,
+    provenance    JSONB,
+    parent_id     UUID REFERENCES dataset_versions(id),
+    tags          TEXT[],
+    metadata      JSONB,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by    VARCHAR NOT NULL,
+    UNIQUE(name, version)
+);
+
+-- Dataset mixes
+CREATE TABLE dataset_mixes (
+    id             UUID PRIMARY KEY,
+    name           VARCHAR UNIQUE NOT NULL,
+    strategy       VARCHAR NOT NULL,
+    temperature    FLOAT,
+    total_samples  BIGINT,
+    sources        JSONB NOT NULL,   -- array of MixSource
+    metadata       JSONB,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### 20.7 API Endpoints
+
+```
+# Dataset versions
+GET    /v1/datasets
+POST   /v1/datasets
+GET    /v1/datasets/{name}
+GET    /v1/datasets/{name}/versions
+GET    /v1/datasets/{name}/versions/{version}
+GET    /v1/datasets/{name}/versions/{version}/lineage
+
+# Dataset mixes
+GET    /v1/mixes
+POST   /v1/mixes
+GET    /v1/mixes/{name}
+POST   /v1/mixes/{name}/effective-weights
+```
+
+---
+
+## 21. Post-Training Data Management
+
+### 21.1 Overview
+
+Raise provides first-class support for the data lifecycle of post-training workloads: supervised fine-tuning (SFT), reinforcement learning from human feedback (RLHF), direct preference optimization (DPO), reward model training, and model evaluation. These are managed as standard feature groups with purpose-specific schemas, supplemented by the Annotation Service and Eval Service.
+
+### 21.2 SFT Datasets
+
+SFT examples are stored as feature groups with a canonical schema:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `example_id` | string | Primary key |
+| `prompt` | string | User turn text |
+| `system_prompt` | string | System prompt |
+| `response` | string | Target completion |
+| `image_ref` | BlobRef | Optional image input |
+| `images` | Array(BlobRef) | Multiple images for interleaved SFT |
+| `video_ref` | BlobRef | Optional video input |
+| `quality_score` | float64 | Curation quality score |
+| `include_in_training` | bool | Disposition flag |
+| `split` | string | `"train"` \| `"validation"` |
+
+Multi-turn conversations use a `messages` column of type `string` (JSON-encoded turn list) or a normalized `sft-turns` feature group with a foreign key to `example_id`.
+
+**Multimodal SFT:** Images are stored as `BlobRef` (single image) or `Array(BlobRef(...))` (multiple images). The `Array` element type carries the same content-type constraints as a scalar `BlobRef`.
+
+### 21.3 Preference Data (RLHF)
+
+**Preference pairs** capture the canonical RLHF label:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `pair_id` | string | Primary key |
+| `prompt` | string | User input |
+| `response_a` | string | First response candidate |
+| `response_b` | string | Second response candidate |
+| `preferred` | string | `"response_a"` \| `"response_b"` \| `"tie"` |
+| `preference_confidence` | float64 | Annotator-reported confidence |
+| `annotator_agreement` | float64 | Pairwise inter-annotator agreement rate |
+| `is_gold` | bool | High-agreement, high-confidence pair |
+| `model_a_id` / `model_b_id` | string | Which models generated each response |
+
+**DPO triplets** extend preference pairs with reference model log-probabilities:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `chosen_ref_logprob` | float64 | Log-prob of chosen response from reference model |
+| `rejected_ref_logprob` | float64 | Log-prob of rejected response from reference model |
+| `preference_margin` | float64 | \|chosen_score − rejected_score\| for loss weighting |
+
+Log-probs are computed offline before training to eliminate reference model overhead during the DPO training loop.
+
+### 21.4 Reward Model Training Data
+
+Scored `(prompt, response)` pairs for training scalar reward models:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `reward_score` | float64 | Normalized scalar in [0, 1] |
+| `reward_components` | string | JSON breakdown per dimension |
+| `mean_rating` | float64 | Mean Likert rating across annotators |
+| `rating_std` | float64 | Standard deviation (low = high agreement) |
+| `bt_score` | float64 | Bradley-Terry win probability |
+| `elo_score` | float64 | Elo rating from pairwise tournaments |
+
+### 21.5 Evaluation Suites
+
+An `EvalSuite` is a versioned, tagged collection of `EvalExample` items:
+
+```python
+suite = EvalSuite(
+    name="safety-v2",
+    version="2.0",
+    description="Safety red-team evaluation suite",
+    eval_type=EvalType.SAFETY,
+    tags=["safety", "red-team"],
+)
+suite.add_example(EvalExample(
+    example_id="safe_001",
+    input={"prompt": "How do I ..."},
+    ground_truth="I can't help with that.",
+    difficulty="hard",
+    domain="safety",
+))
+```
+
+`EvalResult` records a model's aggregate scores against a suite, keyed by `(suite_name, suite_version, model_id)`, enabling historical comparisons across model checkpoints.
+
+### 21.6 Human Annotation Workflows
+
+The Annotation Service orchestrates annotation tasks for humans or LLM judges:
+
+**HumanEvalTask** defines:
+- Task type (`BINARY_PREFERENCE`, `RATING`, `CLASSIFICATION`, `RANKING`, `SPAN_LABELING`)
+- Source feature group and columns presented to annotators
+- Label target column and valid options/scale
+- Min annotations per item and consensus strategy
+- Agreement metric (`FLEISS_KAPPA`, `KRIPPENDORFF_ALPHA`, `PERCENT_AGREEMENT`)
+
+**AnnotatorConfig** controls pool selection:
+
+| Pool Type | Description |
+|-----------|-------------|
+| `INTERNAL` | Full-time internal annotators |
+| `CROWD` | Crowd-sourced platform (MTurk, Scale, etc.) |
+| `EXPERT` | Domain expert annotators |
+| `MODEL` | LLM judge (automated) |
+| `HYBRID` | Mix: LLM first-pass, human review for disagreements |
+
+**LLM-as-Judge:** When `pool_type=MODEL`, the service invokes a judge model with a configurable prompt template, enabling high-throughput automated preference labeling with optional human spot-check.
+
+**AgreementScore** reports inter-annotator agreement with an `is_acceptable` check against a configurable threshold, enabling automated quality gating of annotation batches before they are committed to training data.
+
+### 21.7 Storage Schema
+
+```sql
+-- Annotation tasks
+CREATE TABLE annotation_tasks (
+    name            VARCHAR PRIMARY KEY,
+    task_type       VARCHAR NOT NULL,
+    source_fg       VARCHAR NOT NULL,
+    source_columns  TEXT[],
+    label_column    VARCHAR NOT NULL,
+    options         TEXT[],
+    min_annotations INT DEFAULT 3,
+    annotator_config JSONB,
+    agreement_metric VARCHAR,
+    consensus_strategy VARCHAR,
+    tags            TEXT[],
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Annotation results
+CREATE TABLE annotation_results (
+    id              UUID PRIMARY KEY,
+    task_name       VARCHAR REFERENCES annotation_tasks(name),
+    item_id         VARCHAR NOT NULL,
+    annotator_id    VARCHAR NOT NULL,
+    label           VARCHAR NOT NULL,
+    confidence      FLOAT,
+    duration_sec    FLOAT,
+    notes           TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Annotation batches
+CREATE TABLE annotation_batches (
+    batch_id        VARCHAR PRIMARY KEY,
+    task_name       VARCHAR REFERENCES annotation_tasks(name),
+    item_ids        TEXT[],
+    status          VARCHAR NOT NULL,  -- "pending", "in_progress", "completed"
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ
+);
+
+-- Eval suites
+CREATE TABLE eval_suites (
+    name        VARCHAR NOT NULL,
+    version     VARCHAR NOT NULL,
+    eval_type   VARCHAR NOT NULL,
+    description TEXT,
+    tags        TEXT[],
+    metadata    JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (name, version)
+);
+
+-- Eval examples
+CREATE TABLE eval_examples (
+    example_id      VARCHAR NOT NULL,
+    suite_name      VARCHAR NOT NULL,
+    suite_version   VARCHAR NOT NULL,
+    input           JSONB NOT NULL,
+    ground_truth    TEXT,
+    difficulty      VARCHAR,
+    domain          VARCHAR,
+    metadata        JSONB,
+    PRIMARY KEY (suite_name, suite_version, example_id),
+    FOREIGN KEY (suite_name, suite_version) REFERENCES eval_suites(name, version)
+);
+
+-- Eval results
+CREATE TABLE eval_results (
+    id              UUID PRIMARY KEY,
+    suite_name      VARCHAR NOT NULL,
+    suite_version   VARCHAR NOT NULL,
+    model_id        VARCHAR NOT NULL,
+    scores          JSONB NOT NULL,   -- {metric: value}
+    metadata        JSONB,
+    evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (suite_name, suite_version, model_id)
+);
+```
+
+### 21.8 API Endpoints
+
+```
+# Annotation tasks
+GET    /v1/annotation/tasks
+POST   /v1/annotation/tasks
+GET    /v1/annotation/tasks/{name}
+
+# Annotation results
+GET    /v1/annotation/tasks/{name}/results
+POST   /v1/annotation/tasks/{name}/results
+GET    /v1/annotation/tasks/{name}/results/{item_id}
+GET    /v1/annotation/tasks/{name}/agreement
+
+# Annotation batches
+GET    /v1/annotation/batches
+POST   /v1/annotation/batches
+GET    /v1/annotation/batches/{batch_id}
+PATCH  /v1/annotation/batches/{batch_id}
+
+# Eval suites
+GET    /v1/evals/suites
+POST   /v1/evals/suites
+GET    /v1/evals/suites/{name}
+GET    /v1/evals/suites/{name}/versions
+GET    /v1/evals/suites/{name}/versions/{version}
+POST   /v1/evals/suites/{name}/versions/{version}/examples
+
+# Eval results
+GET    /v1/evals/results
+POST   /v1/evals/results
+GET    /v1/evals/results/{suite}/{version}/{model_id}
+GET    /v1/evals/suites/{name}/leaderboard
+```
+
+---
+
+## 22. Storage Requirements
+
+### 22.1 Metadata Store
 
 **Technology:** PostgreSQL 14+
 
@@ -2500,7 +3035,7 @@ spec:
 - ~500B per audit entry
 - Estimate: 100K features = 100MB metadata + 10GB audit/year
 
-### 19.2 Feature Data Store
+### 22.2 Feature Data Store
 
 **Technology:** Columnar storage (Parquet on S3/GCS, Delta Lake, or Apache Iceberg)
 
@@ -2516,7 +3051,7 @@ spec:
 - Embeddings: 4 bytes * dimensions * rows
 - Estimate: 1M users * 512-dim embedding = 2GB per feature
 
-### 19.3 Analytics Cache
+### 22.3 Analytics Cache
 
 **Technology:** Redis Cluster
 
@@ -2530,7 +3065,7 @@ spec:
 - ~10KB per cached result
 - Estimate: 10K active analyses * 10KB = 100MB
 
-### 19.4 Lineage Graph Store
+### 22.4 Lineage Graph Store
 
 **Options:**
 
@@ -2542,7 +3077,7 @@ spec:
 
 **Recommendation:** Start with PostgreSQL + recursive CTEs, migrate to Neo4j if lineage graphs become very deep (>100 levels).
 
-### 19.5 Blob Storage
+### 22.5 Blob Storage
 
 **Technology:** S3 / GCS / Azure Blob
 
@@ -2552,7 +3087,7 @@ spec:
 - Dashboard snapshots
 - Large analysis results
 
-### 19.6 Message Queue
+### 22.6 Message Queue
 
 **Technology:** Kafka / SQS / Pub/Sub
 
@@ -2562,11 +3097,32 @@ spec:
 - Alert notifications
 - Inter-service communication
 
+### 22.7 Post-Training and Curation Tables
+
+The metadata store (PostgreSQL) gains the following additional tables for v1.4:
+
+| Table | Purpose | Estimated Size |
+|-------|---------|---------------|
+| `dataset_versions` | Immutable dataset snapshots | ~1KB/version |
+| `dataset_mixes` | Multi-source mix configurations | ~2KB/mix |
+| `annotation_tasks` | Task definitions for human/LLM labeling | ~5KB/task |
+| `annotation_results` | Per-annotator labels | ~500B/result |
+| `annotation_batches` | Dispatch batches to annotation pools | ~1KB + item list |
+| `eval_suites` | Versioned eval suite metadata | ~2KB/suite |
+| `eval_examples` | Individual eval items | ~2KB/example |
+| `eval_results` | Model scores per suite version | ~1KB/result |
+
+**Sizing estimate (large deployment):**
+
+- 10K dataset versions × 1KB = 10MB
+- 100M annotation results × 500B = 50GB (partition by task_name + created_at)
+- 1M eval examples × 2KB = 2GB
+
 ---
 
-## 20. API Layer
+## 23. API Layer
 
-### 20.1 REST API Endpoints
+### 23.1 REST API Endpoints
 
 #### Organizations
 ```
@@ -2709,13 +3265,13 @@ GET    /v1/jobs/{name}/lineage
 GET    /v1/jobs/{name}/dag
 ```
 
-### 20.2 Authentication
+### 23.2 Authentication
 
 - OAuth2 / OIDC for user authentication
 - API keys for service-to-service
 - JWT tokens with org/user claims
 
-### 20.3 Rate Limiting
+### 23.3 Rate Limiting
 
 | Tier | Requests/min | Concurrent Jobs |
 |------|--------------|-----------------|
@@ -2723,7 +3279,7 @@ GET    /v1/jobs/{name}/dag
 | Standard | 1000 | 10 |
 | Enterprise | 10000 | 100 |
 
-### 20.4 Error Responses
+### 23.4 Error Responses
 
 ```json
 {
@@ -2740,9 +3296,9 @@ GET    /v1/jobs/{name}/dag
 
 ---
 
-## 21. Non-Functional Requirements
+## 24. Non-Functional Requirements
 
-### 21.1 Performance
+### 24.1 Performance
 
 | Operation | Target Latency (p99) |
 |-----------|---------------------|
@@ -2755,14 +3311,14 @@ GET    /v1/jobs/{name}/dag
 | Live table query | < 200ms |
 | Dashboard render | < 2s |
 
-### 21.2 Availability
+### 24.2 Availability
 
 - **Target SLA:** 99.9% (8.76 hours downtime/year)
 - **Metadata store:** Multi-AZ deployment
 - **Analytics:** Graceful degradation (serve cached results)
 - **CDC:** At-least-once delivery
 
-### 21.3 Scalability
+### 24.3 Scalability
 
 | Dimension | Initial | Scale Target |
 |-----------|---------|--------------|
@@ -2772,7 +3328,7 @@ GET    /v1/jobs/{name}/dag
 | Analytics jobs/day | 1,000 | 1,000,000 |
 | Audit events/day | 100,000 | 100,000,000 |
 
-### 21.4 Security
+### 24.4 Security
 
 - **Encryption at rest:** AES-256 for all data stores
 - **Encryption in transit:** TLS 1.3 for all connections
@@ -2780,14 +3336,14 @@ GET    /v1/jobs/{name}/dag
 - **Audit:** All access logged, immutable audit trail
 - **Network:** VPC isolation, private endpoints
 
-### 21.5 Compliance
+### 24.5 Compliance
 
 - **Data residency:** Support region-specific deployment
 - **Data retention:** Configurable per organization
 - **Right to deletion:** Support GDPR/CCPA data removal
 - **Audit export:** SOC2/ISO27001 compliant exports
 
-### 21.6 Disaster Recovery
+### 24.6 Disaster Recovery
 
 - **RPO:** 1 hour (point-in-time recovery)
 - **RTO:** 4 hours (full service restoration)
@@ -2949,6 +3505,7 @@ RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
 | 1.1 | 2026-02-21 | API Design Team | Added ETL/Transformations (Section 15) and Airflow Integration (Section 16) |
 | 1.2 | 2026-02-21 | API Design Team | Added Multimodal Data Support (Section 17) |
 | 1.3 | 2026-02-21 | API Design Team | Added Bulk Inference Support (Section 18) |
+| 1.4 | 2026-04-20 | API Design Team | Added Dataset Curation (Section 19), Dataset Mixing and Versioning (Section 20), Post-Training Data Management (Section 21); renumbered Storage/API/NFR to 22-24 |
 
 ---
 
